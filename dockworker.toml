@@ -1,0 +1,36 @@
+# dockworker.toml — OCI image for the oxidizedMCP proxy itself.
+#
+# This is the binary that runs as a sidecar / pod in the cluster when
+# oxidizedMCP is deployed centrally. For laptop / IDE use, build with
+# `cargo build --release` and point the IDE at the binary directly.
+#
+# No Dockerfile (per stack convention). dockworker.ai handles OCI packaging.
+#
+# NOTE: this file declares the IMAGE shape only. Container args (e.g.
+# `--health-port 8080 --health-bind-all`) are set in the K8s Deployment
+# spec, not here — see the deploy manifest in the consuming repo.
+
+id = "oxidized-mcp"
+engine = "nix"
+
+[defaults]
+registry = "us-docker.pkg.dev/PROJECT_ID/stevedores"
+
+[provenance]
+slsa = true
+sbom = true
+
+[[targets]]
+name = "oxidized-mcp"
+context = "."
+image = "oxidized-mcp"
+runtime = "rust"
+
+[oci.image]
+authors = ["stevedores-org <community@stevedores.org>"]
+url = "https://github.com/stevedores-org/oxidizedMCP"
+source = "https://github.com/stevedores-org/oxidizedMCP"
+vendor = "stevedores-org"
+licenses = "MIT"
+title = "oxidized-mcp"
+description = "Sovereign Skill Mesh — dynamic MCP proxy"

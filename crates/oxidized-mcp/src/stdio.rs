@@ -1,5 +1,6 @@
 //! MCP JSON-RPC server over stdio (IDE transport).
 
+use crate::health::HealthState;
 use anyhow::Result;
 use oxidized_mcp_core::{
     JsonRpcRequest, JsonRpcResponse, SkillMesh, ToolCallParams, ToolsListResult,
@@ -13,10 +14,15 @@ use tracing::{debug, error, warn};
 const SERVER_NAME: &str = "oxidized-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Run the MCP stdio loop against an already-refreshed mesh. The caller is
-/// responsible for the initial `mesh.refresh()` and for spawning any background
-/// refresh task — this function stays focused on the JSON-RPC transport.
-pub async fn run_stdio_server(mesh: Arc<SkillMesh>) -> Result<()> {
+/// Run the MCP stdio loop against an already-refreshed mesh.
+///
+/// The caller is responsible for the initial `mesh.refresh()`, for spawning
+/// any background refresh task, and for flipping `health.mark_ready()` before
+/// invoking this function — this function stays focused on the JSON-RPC
+/// transport. `health` is unused inside the loop today; the parameter exists
+/// so the caller can let this function drop the handle on exit, simplifying
+/// shutdown ordering.
+pub async fn run_stdio_server(mesh: Arc<SkillMesh>, _health: Option<HealthState>) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 

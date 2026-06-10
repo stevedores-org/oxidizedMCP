@@ -1,5 +1,6 @@
 //! oxidizedMCP — Sovereign Skill Mesh proxy for agents, MCP, and skills.
 
+mod health;
 mod stdio;
 
 use anyhow::{Context, Result};
@@ -8,7 +9,7 @@ use oxidized_mcp_core::{RegistrySource, SkillMesh};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -39,6 +40,18 @@ enum Commands {
         /// previous snapshot remains in place.
         #[arg(long, env = "OXIDIZED_MCP_REFRESH_INTERVAL_SECS", default_value_t = 60)]
         refresh_interval_secs: u64,
+
+        /// Optional port for /healthz and /readyz HTTP probes (cluster deploy).
+        /// Omit for IDE / laptop use — the stdio transport doesn't need it.
+        #[arg(long, env = "OXIDIZED_MCP_HEALTH_PORT")]
+        health_port: Option<u16>,
+
+        /// Bind the health endpoints on all interfaces (0.0.0.0). Default is
+        /// loopback so /healthz on a laptop isn't exposed on the LAN. Set this
+        /// in cluster deployments so kubelet can reach the probe via the pod
+        /// IP. Env var must be the literal string "true" (clap bool semantics).
+        #[arg(long, env = "OXIDIZED_MCP_HEALTH_BIND_ALL")]
+        health_bind_all: bool,
     },
 
     /// Refresh skill discovery from registry and print tool count
@@ -68,12 +81,21 @@ async fn main() -> Result<()> {
             env,
             registry,
             refresh_interval_secs,
+            health_port,
+            health_bind_all,
         } => {
             let source = resolve_registry(registry.as_deref())?;
+            let bind = if health_bind_all {
+                health::HealthBind::All
+            } else {
+                health::HealthBind::Loopback
+            };
             info!(
                 environment = %env,
                 refresh_secs = refresh_interval_secs,
                 ?source,
+                ?health_port,
+                ?bind,
                 "starting oxidizedMCP stdio server"
             );
 
@@ -91,14 +113,34 @@ async fn main() -> Result<()> {
                 None
             };
 
-            let result = stdio::run_stdio_server(mesh.clone())
+            let health_state = health::HealthState::new();
+            let health_handle = health_port.map(|port| {
+                let state_for_server = health_state.clone();
+                let bind_for_server = bind.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = health::serve(port, bind_for_server, state_for_server).await {
+                        error!(error = %e, "health server crashed");
+                    }
+                })
+            });
+
+            // /readyz flips to 200 immediately — the initial refresh above
+            // already succeeded (we'd have errored out otherwise).
+            health_state.mark_ready();
+
+            let result = stdio::run_stdio_server(mesh.clone(), Some(health_state.clone()))
                 .await
                 .context("stdio MCP server failed");
 
             // Stdio loop ended (clean shutdown from EOF, or an error). Either
-            // way, stop the background refresh so the process can exit.
+            // way, stop the background refresh + health server so the process
+            // can exit.
             if let Some(handle) = refresh_handle {
                 handle.abort();
+            }
+            health_state.shutdown();
+            if let Some(handle) = health_handle {
+                let _ = handle.await;
             }
 
             result?;

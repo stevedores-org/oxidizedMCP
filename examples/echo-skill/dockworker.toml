@@ -1,0 +1,34 @@
+# dockworker.toml — OCI image for the echo-skill example.
+#
+# No Dockerfile (per stack convention). Images are built with dockworker.ai
+# (Nix-backed) per OCI Image Spec.
+
+id = "echo-skill"
+engine = "nix"
+
+[defaults]
+# Override per-environment in CI / Flux variable substitution.
+registry = "us-docker.pkg.dev/PROJECT_ID/stevedores"
+
+[provenance]
+slsa = true
+sbom = true
+
+[[targets]]
+name = "echo-skill"
+context = "."
+image = "echo-skill"
+runtime = "rust"
+# The skill binary listens on 0.0.0.0:9100/mcp by default — reachable
+# from oxidized-mcp running outside the container. Override with
+# ECHO_SKILL_BIND=127.0.0.1:9100 for tightened laptop dev when you don't
+# want the listener on every interface.
+
+[oci.image]
+authors = ["stevedores-org <community@stevedores.org>"]
+url = "https://github.com/stevedores-org/oxidizedMCP"
+source = "https://github.com/stevedores-org/oxidizedMCP"
+vendor = "stevedores-org"
+licenses = "MIT"
+title = "echo-skill"
+description = "Minimal containerizable MCP skill for oxidizedMCP local development"

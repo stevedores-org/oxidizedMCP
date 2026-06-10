@@ -76,6 +76,28 @@ The proxy is OCI-packaged via `dockworker.toml` (no Dockerfile). The `--health-p
 
 Tools are aggregated as `skill::tool` (e.g. `echo::echo`) so agents never collide across skills.
 
+### Lornu AI agent skills
+
+`oxidizedMCP` can route repository-focused agent skills through the
+`lornu.ai-mcp` hub. Start `lornu-mcp-hub-rs` in HTTP mode and point each skill
+entry at its JSON-RPC endpoint:
+
+```yaml
+skills:
+  - name: infra-code
+    description: Lornu infra-code agent skill for Crossplane, Flux, ESO, GitOps review, and workspace-safe automation
+    endpoint: http://127.0.0.1:8080/mcp
+    enabled: true
+
+  - name: gke-fleets
+    description: Lornu GKE fleet agent skill for fleet membership, Gateway API, workload identity, and cluster attach workflows
+    endpoint: http://127.0.0.1:8080/mcp
+    enabled: true
+```
+
+Use repo-local manifests in `lornu-ai/infra-code` and
+`lornu-ai/lornu-ai-gke-fleets` for the canonical agent skill scopes.
+
 ## Registry manifest
 
 ```yaml

@@ -173,10 +173,18 @@ impl SkillMesh {
         endpoint: &str,
         request: &JsonRpcRequest,
     ) -> Result<JsonRpcResponse, reqwest::Error> {
-        self.client
-            .post(endpoint)
-            .json(request)
-            .send()
+        let use_azure = std::env::var("OXIDIZED_MCP_USE_AZURE_AD").map(|v| v == "true").unwrap_or(false)
+            || std::env::var("OXIDIZED_MCP_ENV").map(|v| v == "staging" || v == "production").unwrap_or(false);
+
+        let mut req = self.client.post(endpoint).json(request);
+
+        if use_azure && endpoint.starts_with("https://") {
+            if let Ok(token) = self.loader.fetch_azure_token().await {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+        }
+
+        req.send()
             .await?
             .error_for_status()?
             .json()

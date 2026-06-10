@@ -1,0 +1,24 @@
+[package]
+name = "oxidized-mcp"
+description = "Sovereign Skill Mesh — dynamic MCP proxy for agents, skills, and tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "oxidized-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dirs = "6.0"
+oxidized-mcp-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

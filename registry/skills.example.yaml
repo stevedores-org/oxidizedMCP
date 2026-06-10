@@ -1,0 +1,14 @@
+# Copy to registry/skills.yaml or ~/.config/oxidized-mcp/registry.yaml
+version: 1
+environment: local
+skills:
+  - name: echo
+    description: Local echo skill for development
+    endpoint: http://127.0.0.1:9100/mcp
+    enabled: true
+
+  # Future: skills discovered from AKS hub registry
+  # - name: github
+  #   description: GitHub API skill (staging)
+  #   endpoint: https://skills.staging.lornu.ai/github/mcp
+  #   enabled: true

@@ -1,0 +1,7 @@
+version: 1
+environment: local
+skills:
+  - name: echo
+    description: Local echo skill for development
+    endpoint: http://127.0.0.1:9100/mcp
+    enabled: true

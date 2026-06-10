@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p oxidized-mcp

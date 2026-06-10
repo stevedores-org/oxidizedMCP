@@ -4,10 +4,15 @@ use crate::mcp_types::{JsonRpcRequest, JsonRpcResponse, ToolCallResult, ToolDesc
 use crate::registry::{RegistryLoader, RegistrySource, SkillEntry, SkillManifest};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
 
 pub const TOOL_NAMESPACE_SEP: &str = "::";
+
+/// Default TTL between `tools/list` refreshes. Matches the
+/// Issue #3 Epic 3 Feature 3.1 acceptance criterion (60 seconds).
+pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum MeshError {
@@ -32,28 +37,61 @@ pub struct SkillMesh {
     manifest: Option<SkillManifest>,
     tool_index: HashMap<String, (String, String)>,
     aggregated_tools: Vec<ToolDescriptor>,
+    refresh_interval: Duration,
+    last_refreshed: Option<Instant>,
 }
 
 impl SkillMesh {
     pub fn new(registry_source: RegistrySource) -> Self {
+        Self::with_refresh_interval(registry_source, DEFAULT_REFRESH_INTERVAL)
+    }
+
+    /// Construct with a custom TTL between automatic `tools/list` refreshes.
+    /// A zero duration disables auto-refresh — callers must invoke `refresh()` explicitly.
+    pub fn with_refresh_interval(registry_source: RegistrySource, refresh_interval: Duration) -> Self {
         Self {
             loader: RegistryLoader::new(),
             registry_source,
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
+                .timeout(Duration::from_secs(60))
                 .build()
                 .expect("reqwest client"),
             manifest: None,
             tool_index: HashMap::new(),
             aggregated_tools: Vec::new(),
+            refresh_interval,
+            last_refreshed: None,
         }
+    }
+
+    pub fn refresh_interval(&self) -> Duration {
+        self.refresh_interval
     }
 
     pub async fn refresh(&mut self) -> Result<(), MeshError> {
         let manifest = self.loader.load(&self.registry_source).await?;
         self.rebuild_index(&manifest).await?;
         self.manifest = Some(manifest);
+        self.last_refreshed = Some(Instant::now());
         Ok(())
+    }
+
+    /// Refresh from the registry only if the cache has expired (or hasn't been
+    /// populated yet). Returns `true` when a refresh was performed.
+    ///
+    /// Skill backends are not contacted while the cache is fresh — this is the
+    /// path the stdio server takes on every `tools/list` so cold-IDE-restarts
+    /// don't stampede the cluster's skill pods.
+    pub async fn refresh_if_stale(&mut self) -> Result<bool, MeshError> {
+        let is_stale = match self.last_refreshed {
+            None => true,
+            Some(_) if self.refresh_interval.is_zero() => false,
+            Some(last) => last.elapsed() >= self.refresh_interval,
+        };
+        if is_stale {
+            self.refresh().await?;
+        }
+        Ok(is_stale)
     }
 
     pub fn manifest(&self) -> Option<&SkillManifest> {
@@ -272,6 +310,87 @@ skills:
         let tools = mesh.list_tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo-skill::echo");
+    }
+
+    #[tokio::test]
+    async fn refresh_if_stale_populates_on_first_call() {
+        let (endpoint, _handle) = mock_skill_server().await;
+        let path = write_registry(&endpoint);
+
+        let mut mesh = SkillMesh::with_refresh_interval(
+            RegistrySource::File(path),
+            Duration::from_secs(60),
+        );
+
+        let refreshed = mesh.refresh_if_stale().await.unwrap();
+        assert!(refreshed, "first call must refresh from cold cache");
+        assert_eq!(mesh.list_tools().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_if_stale_is_noop_within_ttl() {
+        let (endpoint, _handle) = mock_skill_server().await;
+        let path = write_registry(&endpoint);
+
+        let mut mesh = SkillMesh::with_refresh_interval(
+            RegistrySource::File(path),
+            Duration::from_secs(60),
+        );
+
+        mesh.refresh().await.unwrap();
+        let refreshed = mesh.refresh_if_stale().await.unwrap();
+        assert!(!refreshed, "second call within TTL must not refresh");
+    }
+
+    #[tokio::test]
+    async fn refresh_if_stale_refetches_after_ttl_elapses() {
+        let (endpoint, _handle) = mock_skill_server().await;
+        let path = write_registry(&endpoint);
+
+        // Sub-tick TTL so the test stays fast; behaviour is identical at 60s.
+        let mut mesh = SkillMesh::with_refresh_interval(
+            RegistrySource::File(path),
+            Duration::from_millis(50),
+        );
+
+        mesh.refresh().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let refreshed = mesh.refresh_if_stale().await.unwrap();
+        assert!(refreshed, "must refresh once TTL has elapsed");
+    }
+
+    #[tokio::test]
+    async fn refresh_if_stale_with_zero_ttl_only_refreshes_once() {
+        let (endpoint, _handle) = mock_skill_server().await;
+        let path = write_registry(&endpoint);
+
+        let mut mesh = SkillMesh::with_refresh_interval(
+            RegistrySource::File(path),
+            Duration::ZERO,
+        );
+
+        let first = mesh.refresh_if_stale().await.unwrap();
+        let second = mesh.refresh_if_stale().await.unwrap();
+        assert!(first, "cold cache must refresh even with TTL=0");
+        assert!(!second, "TTL=0 disables auto-refresh after initial populate");
+    }
+
+    fn write_registry(endpoint: &str) -> std::path::PathBuf {
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: echo-skill
+    description: Mock echo
+    endpoint: {endpoint}
+"#
+        );
+        let dir = std::env::temp_dir().join(format!("oxidized-mcp-test-{}", uuid_simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        path
     }
 
     fn uuid_simple() -> u64 {

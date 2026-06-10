@@ -13,6 +13,9 @@ const SERVER_NAME: &str = "oxidized-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub async fn run_stdio_server(mesh: &mut SkillMesh) -> Result<()> {
+    // Initial population. Subsequent `tools/list` calls go through
+    // `refresh_if_stale`, so the IDE always sees a coherent tool set
+    // without re-querying every skill backend on each request.
     mesh.refresh().await?;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -54,7 +57,7 @@ pub async fn run_stdio_server(mesh: &mut SkillMesh) -> Result<()> {
     Ok(())
 }
 
-async fn handle_request(mesh: &SkillMesh, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+async fn handle_request(mesh: &mut SkillMesh, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
     let id = request.id.clone();
 
     match request.method.as_str() {
@@ -71,6 +74,9 @@ async fn handle_request(mesh: &SkillMesh, request: JsonRpcRequest) -> Option<Jso
         )),
         "notifications/initialized" => None,
         "tools/list" => {
+            if let Err(e) = mesh.refresh_if_stale().await {
+                warn!(error = %e, "tools/list refresh failed; serving cached tools");
+            }
             let tools = mesh.list_tools().to_vec();
             Some(JsonRpcResponse::ok(
                 id,
@@ -140,7 +146,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_returns_server_info() {
-        let mesh = SkillMesh::new(RegistrySource::File(std::path::PathBuf::from(
+        let mut mesh = SkillMesh::new(RegistrySource::File(std::path::PathBuf::from(
             "/nonexistent",
         )));
         let req = JsonRpcRequest {
@@ -149,7 +155,7 @@ mod tests {
             method: "initialize".into(),
             params: None,
         };
-        let resp = handle_request(&mesh, req).await.unwrap();
+        let resp = handle_request(&mut mesh, req).await.unwrap();
         let result = resp.result.unwrap();
         assert_eq!(
             result.get("serverInfo").and_then(|v| v.get("name")),

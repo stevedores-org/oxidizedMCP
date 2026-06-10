@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use oxidized_mcp_core::{RegistrySource, SkillMesh};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -31,6 +32,11 @@ enum Commands {
         /// Path to skills registry YAML/JSON manifest
         #[arg(long, env = "OXIDIZED_MCP_REGISTRY")]
         registry: Option<PathBuf>,
+
+        /// TTL between automatic `tools/list` refreshes (seconds). Set to 0 to
+        /// disable auto-refresh entirely. Default 60 (Issue #3 Epic 3 Feature 3.1).
+        #[arg(long, env = "OXIDIZED_MCP_TTL_SECS", default_value_t = 60)]
+        ttl_secs: u64,
     },
 
     /// Refresh skill discovery from registry and print tool count
@@ -56,10 +62,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { env, registry } => {
+        Commands::Start { env, registry, ttl_secs } => {
             let source = resolve_registry(registry.as_deref())?;
-            info!(environment = %env, ?source, "starting oxidizedMCP stdio server");
-            let mut mesh = SkillMesh::new(source);
+            info!(
+                environment = %env,
+                ?source,
+                ttl_secs,
+                "starting oxidizedMCP stdio server"
+            );
+            let mut mesh = SkillMesh::with_refresh_interval(source, Duration::from_secs(ttl_secs));
             stdio::run_stdio_server(&mut mesh)
                 .await
                 .context("stdio MCP server failed")?;

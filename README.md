@@ -75,7 +75,9 @@ skills:
 | `OXIDIZED_MCP_ENV` | Environment label (`local`, `staging`, `production`) |
 | `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` | Re-fetch the registry every N seconds (default `60`; `0` disables) |
 
-## Roadmap (from Issue #1)
+## Roadmap
+
+**MVP (shipped)**: stdio proxy, HTTP routing, registry aggregation — see [Issue #1](https://github.com/stevedores-org/oxidizedMCP/issues/1).
 
 - [x] **Epic 1.1** — Rust proxy, dynamic discovery, JSON-RPC routing
 - [x] **Epic 1.1** — Azure AD OIDC for AKS hub registry
@@ -84,6 +86,15 @@ skills:
 - [ ] **Epic 1.1** — Skill health probes + degraded-skill eviction
 - [ ] **Epic 2** — OCI skill packaging via dockworker.ai
 - [ ] **Epic 3** — Flux/Crossplane skill registry in AKS
+
+**Revised blueprint** ([Issue #3](https://github.com/stevedores-org/oxidizedMCP/issues/3), [docs/TDD_REVISED.md](./docs/TDD_REVISED.md)):
+
+| Epic | Issue | Status |
+|------|-------|--------|
+| Protocol Translator (SSE) | [#4](https://github.com/stevedores-org/oxidizedMCP/issues/4) | Partial |
+| Zero-Trust Auth (`azure_identity`) | [#5](https://github.com/stevedores-org/oxidizedMCP/issues/5) | Partial |
+| Dynamic Registry + 60s cache | [#6](https://github.com/stevedores-org/oxidizedMCP/issues/6) | Partial |
+| Podman local fallback | [#7](https://github.com/stevedores-org/oxidizedMCP/issues/7) | Not started |
 
 ## License
 

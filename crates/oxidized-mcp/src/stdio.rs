@@ -7,34 +7,30 @@ use oxidized_mcp_core::{
     MCP_PROTOCOL_VERSION,
 };
 use serde_json::json;
-use std::io::{self, BufRead, Write};
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
 const SERVER_NAME: &str = "oxidized-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Run the MCP stdio loop against an already-refreshed mesh.
+/// Run the MCP stdio loop against an already-refreshed mesh. The caller is
+/// responsible for the initial `mesh.refresh()`, for spawning any background
+/// refresh task, and for flipping `health.mark_ready()` before invoking this
+/// function — this function stays focused on the JSON-RPC transport.
 ///
-/// The caller is responsible for the initial `mesh.refresh()`, for spawning
-/// any background refresh task, and for flipping `health.mark_ready()` before
-/// invoking this function — this function stays focused on the JSON-RPC
-/// transport. `health` is unused inside the loop today; the parameter exists
-/// so the caller can let this function drop the handle on exit, simplifying
-/// shutdown ordering.
+/// Each request is dispatched on its own task so in-flight `tools/call`
+/// round-trips don't serialize the loop. Responses are tagged by id, so
+/// out-of-order writes are valid JSON-RPC.
+///
+/// `health` is unused inside the loop today; the parameter exists so the caller
+/// can let this function drop the handle on exit, simplifying shutdown ordering.
 pub async fn run_stdio_server(mesh: Arc<SkillMesh>, _health: Option<HealthState>) -> Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                error!(error = %e, "stdin read failed");
-                break;
-            }
-        };
-
+    while let Some(line) = stdin.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -43,21 +39,26 @@ pub async fn run_stdio_server(mesh: Arc<SkillMesh>, _health: Option<HealthState>
             Ok(r) => r,
             Err(e) => {
                 let resp = JsonRpcResponse::err(None, -32700, format!("parse error: {e}"));
-                write_response(&mut stdout, &resp)?;
+                write_response(&stdout, &resp).await?;
                 continue;
             }
         };
 
-        // Notifications have no id — do not write a response
-        if request.id.is_none() && request.method.starts_with("notifications/") {
+        // Notifications have no id — do not write a response.
+        if request.id.is_none() {
             debug!(method = %request.method, "notification received");
             continue;
         }
 
-        let response = handle_request(&mesh, request).await;
-        if let Some(resp) = response {
-            write_response(&mut stdout, &resp)?;
-        }
+        let mesh = mesh.clone();
+        let stdout = stdout.clone();
+        tokio::spawn(async move {
+            if let Some(resp) = handle_request(&mesh, request).await {
+                if let Err(e) = write_response(&stdout, &resp).await {
+                    error!(error = %e, "failed to write response");
+                }
+            }
+        });
     }
 
     Ok(())
@@ -78,7 +79,6 @@ async fn handle_request(mesh: &SkillMesh, request: JsonRpcRequest) -> Option<Jso
                 }
             }),
         )),
-        "notifications/initialized" => None,
         "tools/list" => {
             let tools = mesh.list_tools();
             Some(JsonRpcResponse::ok(
@@ -135,10 +135,15 @@ async fn handle_request(mesh: &SkillMesh, request: JsonRpcRequest) -> Option<Jso
     }
 }
 
-fn write_response(stdout: &mut impl Write, response: &JsonRpcResponse) -> Result<()> {
-    let payload = serde_json::to_string(response)?;
-    writeln!(stdout, "{payload}")?;
-    stdout.flush()?;
+async fn write_response(
+    stdout: &Mutex<tokio::io::Stdout>,
+    response: &JsonRpcResponse,
+) -> Result<()> {
+    let mut payload = serde_json::to_vec(response)?;
+    payload.push(b'\n');
+    let mut guard = stdout.lock().await;
+    guard.write_all(&payload).await?;
+    guard.flush().await?;
     Ok(())
 }
 

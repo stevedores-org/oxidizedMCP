@@ -1,6 +1,8 @@
 # Technical Design: Sovereign Skill Mesh (`oxidizedMCP`)
 
-Status: **MVP in progress** — see [Issue #1](https://github.com/stevedores-org/oxidizedMCP/issues/1)
+Status: **MVP shipped; revised planning active** — see [Issue #1](https://github.com/stevedores-org/oxidizedMCP/issues/1) (founding principles) and [Issue #3](https://github.com/stevedores-org/oxidizedMCP/issues/3) (revised TDD).
+
+> **Authoritative revised blueprint**: [docs/TDD_REVISED.md](./TDD_REVISED.md) (gap analysis + epic mapping)
 
 ## Problem
 
@@ -36,8 +38,18 @@ A **small Rust binary on the laptop** that does not execute skills — it **disc
 2. Proxy loads registry, calls each skill's `tools/list`, merges as `skill::tool`
 3. On `tools/call`, proxy forwards JSON-RPC to the skill's HTTP `/mcp` endpoint
 
-## Security (planned)
+## Security (in progress — Epic 2)
 
-- Local: registry file or localhost-only skills
-- Staging/prod: OIDC workload identity from laptop → AKS hub registry
-- No API keys on laptops; ESO in cluster
+- **Local**: registry file or localhost-only skills
+- **Staging/prod**: `azure_identity` / `az login` Bearer tokens → AKS ingress JWT validation
+- **MVP today**: `az account get-access-token`, env bearer tokens, workload-identity federated exchange (`registry.rs`)
+- **Target**: `DefaultAzureCredential` with token refresh loop; no static API keys on laptops; ESO in cluster
+
+## Resilience (planned — Epic 4)
+
+- HTTP timeout → Podman image check → `podman run -i` stdio passthrough
+- Circuit breaker on repeated AKS failures
+
+## Streaming (planned — Epic 1)
+
+- Long-running `tools/call` responses via SSE from cloud skills back to IDE stdio

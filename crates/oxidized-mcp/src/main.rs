@@ -5,7 +5,7 @@ mod stdio;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use oxidized_mcp_core::{AuthMode, Authenticator, RegistrySource, SkillMesh};
+use oxidized_mcp_core::{AuthMode, Authenticator, RegistrySource, SkillMesh, SkillStatus};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +64,16 @@ enum Commands {
     ListTools {
         #[arg(long, env = "OXIDIZED_MCP_REGISTRY")]
         registry: Option<PathBuf>,
+    },
+
+    /// Inspect per-skill health from the last refresh
+    Health {
+        #[arg(long, env = "OXIDIZED_MCP_REGISTRY")]
+        registry: Option<PathBuf>,
+
+        /// Emit JSON instead of the human-readable table
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -171,9 +181,59 @@ async fn main() -> Result<()> {
                 println!("{} — {}", tool.name, tool.description);
             }
         }
+        Commands::Health { registry, json } => {
+            let source = resolve_registry(registry.as_deref())?;
+            let mesh = SkillMesh::new(source);
+            // Refresh ignores transient registry errors so `health` can still
+            // emit the prior snapshot (empty on a cold start) — operators want
+            // to see SOMETHING when triaging an outage.
+            if let Err(e) = mesh.refresh().await {
+                warn!(error = %e, "refresh failed before health probe; showing prior snapshot");
+            }
+            let health = mesh.health();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&health)?);
+            } else {
+                print_health_table(&health);
+            }
+            // Non-zero exit if any skill is Down — useful for CI gates.
+            if health.values().any(|h| h.status == SkillStatus::Down) {
+                std::process::exit(2);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_health_table(health: &std::collections::BTreeMap<String, oxidized_mcp_core::SkillHealth>) {
+    if health.is_empty() {
+        println!("no skills in registry");
+        return;
+    }
+    let name_width = health.keys().map(|n| n.len()).max().unwrap_or(4).max(6);
+    println!(
+        "{:<name_width$}  {:<8}  {:>6}  LAST ERROR",
+        "SKILL",
+        "STATUS",
+        "TOOLS",
+        name_width = name_width,
+    );
+    for (name, h) in health {
+        let status = match h.status {
+            SkillStatus::Healthy => "healthy",
+            SkillStatus::Down => "DOWN",
+        };
+        let last_error = h.last_error.as_deref().unwrap_or("");
+        println!(
+            "{:<name_width$}  {:<8}  {:>6}  {}",
+            name,
+            status,
+            h.tools_count,
+            last_error,
+            name_width = name_width,
+        );
+    }
 }
 
 /// Spawn a background task that re-fetches the registry on a fixed interval.

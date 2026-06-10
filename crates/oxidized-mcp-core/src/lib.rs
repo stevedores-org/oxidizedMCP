@@ -10,5 +10,6 @@ pub use mcp_types::{
 };
 pub use registry::{RegistryError, RegistryLoader, RegistrySource, SkillEntry, SkillManifest};
 pub use router::{
-    namespaced_tool, parse_namespaced_tool, MeshError, SkillMesh, TOOL_NAMESPACE_SEP,
+    namespaced_tool, parse_namespaced_tool, MeshError, SkillHealth, SkillMesh, SkillStatus,
+    TOOL_NAMESPACE_SEP,
 };

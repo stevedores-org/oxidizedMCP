@@ -3,7 +3,9 @@
 use crate::mcp_types::{JsonRpcRequest, JsonRpcResponse, ToolCallResult, ToolDescriptor};
 use crate::registry::{RegistryLoader, RegistrySource, SkillEntry, SkillManifest};
 use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -24,15 +26,38 @@ pub enum MeshError {
     Http(String, #[source] reqwest::Error),
     #[error("skill '{0}' returned error: {1}")]
     SkillError(String, String),
+    #[error("skill '{skill}' is unreachable (last error: {last_error})")]
+    SkillUnreachable { skill: String, last_error: String },
+}
+
+/// Health status of a single skill as observed at the last `refresh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillStatus {
+    Healthy,
+    Down,
+}
+
+/// Per-skill health observed at the last refresh. `tools_count` is the count
+/// from the most recent successful `tools/list`; it stays at the last good
+/// value while the skill is Down so operators can see what the skill used to
+/// expose. `last_error` is populated whenever the latest probe failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillHealth {
+    pub status: SkillStatus,
+    pub tools_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Immutable view of the mesh at one moment. `refresh` builds a new snapshot
 /// and atomically swaps it into place so concurrent readers always see a
-/// consistent `(manifest, aggregated_tools)` pair.
+/// consistent `(manifest, aggregated_tools, health)` triple.
 #[derive(Default)]
 struct MeshSnapshot {
     manifest: Option<SkillManifest>,
     aggregated_tools: Vec<ToolDescriptor>,
+    health: BTreeMap<String, SkillHealth>,
 }
 
 pub struct SkillMesh {
@@ -77,12 +102,26 @@ impl SkillMesh {
         self.snapshot.load().aggregated_tools.clone()
     }
 
+    /// Per-skill health from the most recent refresh, keyed by skill name.
+    /// BTreeMap so ops output is sorted deterministically.
+    pub fn health(&self) -> BTreeMap<String, SkillHealth> {
+        self.snapshot.load().health.clone()
+    }
+
     pub async fn call_tool(
         &self,
         namespaced_name: &str,
         arguments: Value,
     ) -> Result<ToolCallResult, MeshError> {
         let (skill_name, tool_name) = parse_namespaced_tool(namespaced_name)?;
+        // Fast-fail on skills we already know are down — the HTTP attempt
+        // would burn the per-call timeout before returning the same error.
+        if let Some(reason) = self.skill_unreachable_reason(&skill_name) {
+            return Err(MeshError::SkillUnreachable {
+                skill: skill_name,
+                last_error: reason,
+            });
+        }
         let endpoint = self.resolve_skill_endpoint(&skill_name)?;
 
         let request = JsonRpcRequest {
@@ -116,10 +155,12 @@ impl SkillMesh {
 
     async fn build_snapshot(&self, manifest: SkillManifest) -> MeshSnapshot {
         let mut aggregated = Vec::new();
+        let mut health = BTreeMap::new();
 
         for skill in manifest.active_skills() {
             match self.fetch_skill_tools(skill).await {
                 Ok(tools) => {
+                    let tools_count = tools.len();
                     for tool in tools {
                         let namespaced =
                             format!("{}{}{}", skill.name, TOOL_NAMESPACE_SEP, tool.name);
@@ -129,18 +170,40 @@ impl SkillMesh {
                             input_schema: tool.input_schema,
                         });
                     }
+                    health.insert(
+                        skill.name.clone(),
+                        SkillHealth {
+                            status: SkillStatus::Healthy,
+                            tools_count,
+                            last_error: None,
+                        },
+                    );
                 }
                 Err(e) => {
-                    warn!(skill = %skill.name, error = %e, "skipping skill during discovery");
+                    let err_str = e.to_string();
+                    warn!(skill = %skill.name, error = %err_str, "skill probe failed; marking Down");
+                    health.insert(
+                        skill.name.clone(),
+                        SkillHealth {
+                            status: SkillStatus::Down,
+                            tools_count: 0,
+                            last_error: Some(err_str),
+                        },
+                    );
                 }
             }
         }
 
         aggregated.sort_by(|a, b| a.name.cmp(&b.name));
-        debug!(tool_count = aggregated.len(), "skill mesh snapshot built");
+        debug!(
+            tool_count = aggregated.len(),
+            skill_count = health.len(),
+            "skill mesh snapshot built"
+        );
         MeshSnapshot {
             manifest: Some(manifest),
             aggregated_tools: aggregated,
+            health,
         }
     }
 
@@ -213,6 +276,25 @@ impl SkillMesh {
             .ok_or_else(|| MeshError::SkillNotFound(name.to_string()))?;
         Ok(endpoint)
     }
+
+    /// Returns Some(last_error) when the skill is known to be Down.
+    /// Returns None when the skill is Healthy or has no recorded health yet
+    /// (e.g. before the first refresh) — the caller proceeds with the HTTP
+    /// attempt in that case, so we never reject calls based on stale absence.
+    fn skill_unreachable_reason(&self, name: &str) -> Option<String> {
+        let snapshot = self.snapshot.load();
+        let health = snapshot.health.get(name)?;
+        if health.status == SkillStatus::Down {
+            Some(
+                health
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string()),
+            )
+        } else {
+            None
+        }
+    }
 }
 
 pub fn parse_namespaced_tool(name: &str) -> Result<(String, String), MeshError> {
@@ -233,9 +315,9 @@ pub fn namespaced_tool(skill: &str, tool: &str) -> String {
 mod tests {
     use super::*;
     use crate::mcp_types::{JsonRpcResponse, ToolsListResult};
-    use axum::{routing::post, Json, Router};
+    use axum::{response::IntoResponse, routing::post, Json, Router};
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     async fn mock_skill_server() -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new().route(
@@ -324,6 +406,65 @@ mod tests {
         (format!("http://{addr}/mcp"), counter, handle)
     }
 
+    /// Skill server that can be toggled between healthy (returns tools) and
+    /// down (returns 500). Used to verify health tracking across refreshes
+    /// and that call_tool fast-fails on Down skills.
+    async fn mock_toggleable_skill_server() -> (String, Arc<AtomicBool>, tokio::task::JoinHandle<()>)
+    {
+        let down = Arc::new(AtomicBool::new(false));
+        let app_down = down.clone();
+        let app = Router::new().route(
+            "/mcp",
+            post(move |Json(req): Json<JsonRpcRequest>| {
+                let d = app_down.clone();
+                async move {
+                    if d.load(Ordering::SeqCst) {
+                        return (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(JsonRpcResponse::err(req.id, -32000, "skill down")),
+                        )
+                            .into_response();
+                    }
+                    match req.method.as_str() {
+                        "tools/list" => Json(JsonRpcResponse::ok(
+                            req.id,
+                            serde_json::to_value(ToolsListResult {
+                                tools: vec![ToolDescriptor {
+                                    name: "ping".to_string(),
+                                    description: "Ping".to_string(),
+                                    input_schema: json!({}),
+                                }],
+                            })
+                            .unwrap(),
+                        ))
+                        .into_response(),
+                        "tools/call" => Json(JsonRpcResponse::ok(
+                            req.id,
+                            serde_json::to_value(ToolCallResult::text("pong")).unwrap(),
+                        ))
+                        .into_response(),
+                        _ => Json(JsonRpcResponse::err(req.id, -32601, "unknown")).into_response(),
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/mcp"), down, handle)
+    }
+
+    fn write_registry(yaml: &str, tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxidized-mcp-{tag}-{}", uuid_simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        path
+    }
+
     #[tokio::test]
     async fn discovers_and_lists_namespaced_tools() {
         let (endpoint, _handle) = mock_skill_server().await;
@@ -337,10 +478,7 @@ skills:
     endpoint: {endpoint}
 "#
         );
-        let dir = std::env::temp_dir().join(format!("oxidized-mcp-test-{}", uuid_simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("registry.yaml");
-        std::fs::write(&path, yaml).unwrap();
+        let path = write_registry(&yaml, "discover");
 
         let mesh = SkillMesh::new(RegistrySource::File(path));
         mesh.refresh().await.unwrap();
@@ -364,10 +502,7 @@ skills:
     endpoint: {endpoint}
 "#
         );
-        let dir = std::env::temp_dir().join(format!("oxidized-mcp-rtest-{}", uuid_simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("registry.yaml");
-        std::fs::write(&path, yaml).unwrap();
+        let path = write_registry(&yaml, "rtest");
 
         let mesh = Arc::new(SkillMesh::new(RegistrySource::File(path)));
         mesh.refresh().await.unwrap();
@@ -402,10 +537,7 @@ skills:
     endpoint: {endpoint}
 "#
         );
-        let dir = std::env::temp_dir().join(format!("oxidized-mcp-stale-{}", uuid_simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("registry.yaml");
-        std::fs::write(&path, &yaml).unwrap();
+        let path = write_registry(&yaml, "stale");
 
         let mesh = SkillMesh::new(RegistrySource::File(path.clone()));
         mesh.refresh().await.unwrap();
@@ -418,6 +550,89 @@ skills:
         let after = mesh.list_tools();
         assert_eq!(after.len(), 1, "stale snapshot survives a failed refresh");
         assert_eq!(after[0].name, "echo-skill::echo");
+    }
+
+    /// A down skill is recorded as such in the health map after refresh, and
+    /// once the skill recovers a subsequent refresh marks it Healthy again.
+    #[tokio::test]
+    async fn health_tracks_skill_status_across_refreshes() {
+        let (endpoint, down, _handle) = mock_toggleable_skill_server().await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: flaky
+    description: Toggleable skill
+    endpoint: {endpoint}
+"#
+        );
+        let path = write_registry(&yaml, "health");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+        let h = mesh.health();
+        assert_eq!(h["flaky"].status, SkillStatus::Healthy);
+        assert_eq!(h["flaky"].tools_count, 1);
+        assert!(h["flaky"].last_error.is_none());
+
+        // Take the skill down and refresh again.
+        down.store(true, Ordering::SeqCst);
+        mesh.refresh().await.unwrap();
+        let h = mesh.health();
+        assert_eq!(h["flaky"].status, SkillStatus::Down);
+        assert!(h["flaky"].last_error.is_some());
+
+        // Recover the skill and refresh — status returns to Healthy.
+        down.store(false, Ordering::SeqCst);
+        mesh.refresh().await.unwrap();
+        let h = mesh.health();
+        assert_eq!(h["flaky"].status, SkillStatus::Healthy);
+        assert_eq!(h["flaky"].tools_count, 1);
+    }
+
+    /// call_tool refuses to issue a network request when the skill is known
+    /// Down — the error must be SkillUnreachable, not Http, proving the fast
+    /// path triggered.
+    #[tokio::test]
+    async fn call_tool_fast_fails_on_down_skill() {
+        let (endpoint, down, _handle) = mock_toggleable_skill_server().await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: flaky
+    description: Toggleable skill
+    endpoint: {endpoint}
+"#
+        );
+        let path = write_registry(&yaml, "fastfail");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+
+        // Sanity: healthy → call_tool succeeds.
+        let ok = mesh.call_tool("flaky::ping", json!({})).await;
+        assert!(ok.is_ok(), "healthy skill call should succeed, got {ok:?}");
+
+        // Take down, refresh so the snapshot reflects the failure, then call.
+        down.store(true, Ordering::SeqCst);
+        mesh.refresh().await.unwrap();
+        let err = mesh
+            .call_tool("flaky::ping", json!({}))
+            .await
+            .expect_err("Down skill must fail");
+        match err {
+            MeshError::SkillUnreachable { skill, last_error } => {
+                assert_eq!(skill, "flaky");
+                assert!(
+                    !last_error.is_empty(),
+                    "fast-fail must include the recorded probe error"
+                );
+            }
+            other => panic!("expected SkillUnreachable, got {other:?}"),
+        }
     }
 
     fn uuid_simple() -> u64 {

@@ -45,10 +45,10 @@ If AKS hub times out:
 | stdio MCP server | `crates/oxidized-mcp/src/stdio.rs` | Epic 1 | **Partial** — no SSE streaming |
 | stdio → HTTP routing | `oxidized-mcp-core` router | Epic 1 | **Done** for sync HTTP |
 | `tools/list` aggregation | `SkillMesh` + namespacing | Epic 3 | **Done** locally |
-| Registry URL fetch | `registry.rs` + `--refresh-interval-secs` (default 60) | Epic 3 | **Done** — file/URL sources with periodic refresh; needs K8s ConfigMap source next |
+| Registry URL fetch | `registry.rs` + `--refresh-interval-secs` (default 60) | Epic 3 | **Done** — file/URL sources with periodic refresh. Static manifest covers mounted ConfigMaps; the real next gap is *in-cluster discovery* (Kube API watch for ConfigMap changes, or a hub-API HTTP endpoint) rather than the source format itself. |
 | Azure auth | `az account get-access-token`, env bearer tokens, federated workload-identity exchange (`registry.rs`) | Epic 2 | **Partial** — federated path shipped for in-cluster; `DefaultAzureCredential` for laptop dev still pending |
 | Health probes | `--health-port` + `/healthz` / `/readyz` (PR #11) | Epic 1.1 | **Done** — loopback by default, `--health-bind-all` for cluster pods |
-| OCI packaging | `dockworker.toml` at workspace root + on echo-skill (PR #11) | Epic 1.1 | **Done** — manifests only; build pipeline still consumes dockworker.ai |
+| OCI packaging | `dockworker.toml` at workspace root + on echo-skill (PR #11) | Epic 1.1 | **Partial** — `dockworker.toml` manifests committed; no OCI image has actually been built from them yet (nothing has invoked dockworker.ai). |
 | Podman fallback | — | Epic 4 | **Not started** |
 | Hub skill-registry service | — | Epic 3 | **Not started** (`lornu-ai/skills-registry`) |
 | Ingress JWT validation | — | Epic 2 (infra) | **Not started** |

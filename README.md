@@ -80,8 +80,8 @@ skills:
 - [x] **Epic 1.1** — Rust proxy, dynamic discovery, JSON-RPC routing
 - [x] **Epic 1.1** — Azure AD OIDC for AKS hub registry
 - [x] **Epic 1.1** — Periodic registry refresh with atomic snapshot swap
+- [x] **Epic 1.1** — Skill health probes + degraded-skill fast-fail (`oxidized-mcp health`)
 - [ ] **Epic 1.1** — Per-skill auth (forward IDE bearer or Workload Identity)
-- [ ] **Epic 1.1** — Skill health probes + degraded-skill eviction
 - [ ] **Epic 2** — OCI skill packaging via dockworker.ai
 - [ ] **Epic 3** — Flux/Crossplane skill registry in AKS
 

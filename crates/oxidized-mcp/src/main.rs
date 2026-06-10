@@ -5,7 +5,7 @@ mod stdio;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use oxidized_mcp_core::{RegistrySource, SkillMesh};
+use oxidized_mcp_core::{AuthMode, Authenticator, RegistrySource, SkillMesh};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,16 +90,18 @@ async fn main() -> Result<()> {
             } else {
                 health::HealthBind::Loopback
             };
+            let auth_mode = AuthMode::from_env();
             info!(
                 environment = %env,
                 refresh_secs = refresh_interval_secs,
                 ?source,
                 ?health_port,
                 ?bind,
+                ?auth_mode,
                 "starting oxidizedMCP stdio server"
             );
 
-            let mesh = Arc::new(SkillMesh::new(source));
+            let mesh = Arc::new(SkillMesh::with_auth(source, Authenticator::new(auth_mode)));
             mesh.refresh()
                 .await
                 .context("initial registry refresh failed")?;

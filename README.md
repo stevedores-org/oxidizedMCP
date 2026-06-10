@@ -98,6 +98,27 @@ skills:
 | `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` | Re-fetch the registry every N seconds (default `60`; `0` disables) |
 | `OXIDIZED_MCP_HEALTH_PORT` | TCP port for `/healthz` and `/readyz` (unset = no HTTP probes) |
 | `OXIDIZED_MCP_HEALTH_BIND_ALL` | `"true"` to bind health endpoints on `0.0.0.0` (cluster pods); default loopback |
+| `OXIDIZED_MCP_AUTH_MODE` | Outbound-call auth: `none` (default), or `gcloud-identity` for GKE Gateway / IAP backends |
+| `OXIDIZED_MCP_AUTH_AUDIENCE` | Optional `--audiences` flag for `gcloud auth print-identity-token` |
+
+### Authenticating to GKE Gateway / IAP backends
+
+When skill endpoints live behind a GKE Gateway listener that validates Google
+identity tokens, set:
+
+```bash
+export OXIDIZED_MCP_AUTH_MODE=gcloud-identity
+export OXIDIZED_MCP_AUTH_AUDIENCE=https://api.lornu.ai     # whatever the Gateway expects
+```
+
+oxidizedMCP shells out to `gcloud auth print-identity-token` and attaches the
+result as `Authorization: Bearer …` on every outbound `tools/list` and
+`tools/call`. Tokens are cached in-process for ~55 minutes (gcloud ID-token
+lifetime is 60). **No static secrets touch disk** — the developer's existing
+`gcloud auth login` session is the only credential surface.
+
+If `gcloud` is missing or the session has expired, requests fail with a clear
+error pointing the user at `gcloud auth login`.
 
 ## Roadmap (from Issue #1)
 
@@ -105,10 +126,13 @@ skills:
 - [x] **Epic 1.1** — Azure AD OIDC for AKS hub registry
 - [x] **Epic 1.1** — Periodic registry refresh with atomic snapshot swap
 - [x] **Epic 1.1** — `/healthz` + `/readyz` HTTP probes + dockworker.toml manifests
+- [x] **Epic 2** — Outbound auth via GCP identity tokens (gcloud-identity mode)
 - [ ] **Epic 1.1** — Per-skill auth (forward IDE bearer or Workload Identity)
 - [ ] **Epic 1.1** — Skill health probes + degraded-skill eviction
+- [ ] **Epic 2** — Workload Identity Federation for cluster-side `oxidized-mcp` (not just developer laptops)
 - [ ] **Epic 2** — OCI skill packaging via dockworker.ai
-- [ ] **Epic 3** — Flux/Crossplane skill registry in AKS
+- [ ] **Epic 3** — Flux/Crossplane skill registry in the GKE hub
+- [ ] **Epic 4** — Podman fallback for offline mode
 
 ## License
 

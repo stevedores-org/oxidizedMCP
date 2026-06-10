@@ -1,9 +1,11 @@
 //! oxidizedMCP core — registry, discovery, and skill routing.
 
+pub mod auth;
 pub mod mcp_types;
 pub mod registry;
 pub mod router;
 
+pub use auth::{AuthError, AuthMode, Authenticator};
 pub use mcp_types::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolCallResult,
     ToolContentBlock, ToolDescriptor, ToolsListResult, MCP_PROTOCOL_VERSION,

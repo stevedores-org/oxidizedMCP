@@ -9,4 +9,6 @@ pub use mcp_types::{
     ToolContentBlock, ToolDescriptor, ToolsListResult, MCP_PROTOCOL_VERSION,
 };
 pub use registry::{RegistryError, RegistryLoader, RegistrySource, SkillEntry, SkillManifest};
-pub use router::{namespaced_tool, parse_namespaced_tool, MeshError, SkillMesh, TOOL_NAMESPACE_SEP};
+pub use router::{
+    namespaced_tool, parse_namespaced_tool, MeshError, SkillMesh, TOOL_NAMESPACE_SEP,
+};

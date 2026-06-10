@@ -83,8 +83,12 @@ impl RegistryLoader {
     }
 
     pub async fn load_url(&self, url: &str) -> Result<SkillManifest, RegistryError> {
-        let use_azure = std::env::var("OXIDIZED_MCP_USE_AZURE_AD").map(|v| v == "true").unwrap_or(false)
-            || std::env::var("OXIDIZED_MCP_ENV").map(|v| v == "staging" || v == "production").unwrap_or(false);
+        let use_azure = std::env::var("OXIDIZED_MCP_USE_AZURE_AD")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+            || std::env::var("OXIDIZED_MCP_ENV")
+                .map(|v| v == "staging" || v == "production")
+                .unwrap_or(false);
 
         let mut req = self.client.get(url);
 
@@ -109,7 +113,9 @@ impl RegistryLoader {
 
     pub async fn fetch_azure_token(&self) -> Result<String, String> {
         // 1. Check if an explicit token is provided in env
-        if let Ok(token) = std::env::var("OXIDIZED_MCP_BEARER_TOKEN").or_else(|_| std::env::var("LORNU_BEARER_TOKEN")) {
+        if let Ok(token) = std::env::var("OXIDIZED_MCP_BEARER_TOKEN")
+            .or_else(|_| std::env::var("LORNU_BEARER_TOKEN"))
+        {
             let trimmed = token.trim();
             if !trimmed.is_empty() {
                 return Ok(trimmed.to_string());
@@ -117,7 +123,9 @@ impl RegistryLoader {
         }
 
         // 2. Check if a token file is provided in env
-        if let Ok(token_file) = std::env::var("OXIDIZED_MCP_BEARER_TOKEN_FILE").or_else(|_| std::env::var("LORNU_BEARER_TOKEN_FILE")) {
+        if let Ok(token_file) = std::env::var("OXIDIZED_MCP_BEARER_TOKEN_FILE")
+            .or_else(|_| std::env::var("LORNU_BEARER_TOKEN_FILE"))
+        {
             if let Ok(content) = std::fs::read_to_string(token_file.trim()) {
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
@@ -132,10 +140,12 @@ impl RegistryLoader {
                 .map_err(|e| format!("failed to read federated token file: {e}"))?;
             let federated_token = federated_token.trim();
 
-            let client_id = std::env::var("AZURE_CLIENT_ID")
-                .map_err(|_| "AZURE_CLIENT_ID env var is required for workload identity".to_string())?;
-            let tenant_id = std::env::var("AZURE_TENANT_ID")
-                .map_err(|_| "AZURE_TENANT_ID env var is required for workload identity".to_string())?;
+            let client_id = std::env::var("AZURE_CLIENT_ID").map_err(|_| {
+                "AZURE_CLIENT_ID env var is required for workload identity".to_string()
+            })?;
+            let tenant_id = std::env::var("AZURE_TENANT_ID").map_err(|_| {
+                "AZURE_TENANT_ID env var is required for workload identity".to_string()
+            })?;
             let authority_host = std::env::var("AZURE_AUTHORITY_HOST")
                 .unwrap_or_else(|_| "https://login.microsoftonline.com".to_string());
 
@@ -143,17 +153,26 @@ impl RegistryLoader {
                 .or_else(|_| std::env::var("OXIDIZED_MCP_AZURE_SCOPE"))
                 .unwrap_or_else(|_| "https://management.azure.com/.default".to_string());
 
-            let token_url = format!("{}/{}/oauth2/v2.0/token", authority_host.trim_end_matches('/'), tenant_id);
+            let token_url = format!(
+                "{}/{}/oauth2/v2.0/token",
+                authority_host.trim_end_matches('/'),
+                tenant_id
+            );
 
             let params = [
                 ("grant_type", "client_credentials"),
                 ("client_id", &client_id),
-                ("client_assertion_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                ),
                 ("client_assertion", federated_token),
                 ("scope", &resource),
             ];
 
-            let res = self.client.post(&token_url)
+            let res = self
+                .client
+                .post(&token_url)
                 .form(&params)
                 .send()
                 .await
@@ -162,14 +181,19 @@ impl RegistryLoader {
             if !res.status().is_success() {
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
-                return Err(format!("token exchange failed with status {}: {}", status, body));
+                return Err(format!(
+                    "token exchange failed with status {}: {}",
+                    status, body
+                ));
             }
 
-            let val: serde_json::Value = res.json()
+            let val: serde_json::Value = res
+                .json()
                 .await
                 .map_err(|e| format!("failed to parse token exchange JSON response: {e}"))?;
 
-            let token = val.get("access_token")
+            let token = val
+                .get("access_token")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "access_token missing from response".to_string())?;
 
@@ -184,16 +208,22 @@ impl RegistryLoader {
             cmd.args(["--resource", res]);
         }
 
-        let output = cmd.output().map_err(|e| format!("failed to run 'az': {e}"))?;
+        let output = cmd
+            .output()
+            .map_err(|e| format!("failed to run 'az': {e}"))?;
         if !output.status.success() {
             let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(format!("'az' command exited with error: {}", err_msg.trim()));
+            return Err(format!(
+                "'az' command exited with error: {}",
+                err_msg.trim()
+            ));
         }
 
         let val: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|e| format!("failed to parse token JSON: {e}"))?;
 
-        let token = val.get("accessToken")
+        let token = val
+            .get("accessToken")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "accessToken missing from JSON".to_string())?;
 
@@ -267,4 +297,3 @@ skills:
         }
     }
 }
-

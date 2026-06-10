@@ -73,11 +73,15 @@ skills:
 | `OXIDIZED_MCP_REGISTRY` | Path to local manifest YAML |
 | `OXIDIZED_MCP_REGISTRY_URL` | Remote manifest URL (JSON) |
 | `OXIDIZED_MCP_ENV` | Environment label (`local`, `staging`, `production`) |
+| `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` | Re-fetch the registry every N seconds (default `60`; `0` disables) |
 
 ## Roadmap (from Issue #1)
 
 - [x] **Epic 1.1** — Rust proxy, dynamic discovery, JSON-RPC routing
-- [ ] **Epic 1.1** — Azure AD OIDC for AKS hub registry
+- [x] **Epic 1.1** — Azure AD OIDC for AKS hub registry
+- [x] **Epic 1.1** — Periodic registry refresh with atomic snapshot swap
+- [ ] **Epic 1.1** — Per-skill auth (forward IDE bearer or Workload Identity)
+- [ ] **Epic 1.1** — Skill health probes + degraded-skill eviction
 - [ ] **Epic 2** — OCI skill packaging via dockworker.ai
 - [ ] **Epic 3** — Flux/Crossplane skill registry in AKS
 

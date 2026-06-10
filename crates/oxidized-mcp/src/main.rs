@@ -6,7 +6,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use oxidized_mcp_core::{RegistrySource, SkillMesh};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -31,6 +33,12 @@ enum Commands {
         /// Path to skills registry YAML/JSON manifest
         #[arg(long, env = "OXIDIZED_MCP_REGISTRY")]
         registry: Option<PathBuf>,
+
+        /// Re-fetch the registry every N seconds. 0 disables periodic refresh
+        /// (one-shot at startup only). Failed refreshes are logged and the
+        /// previous snapshot remains in place.
+        #[arg(long, env = "OXIDIZED_MCP_REFRESH_INTERVAL_SECS", default_value_t = 60)]
+        refresh_interval_secs: u64,
     },
 
     /// Refresh skill discovery from registry and print tool count
@@ -56,17 +64,48 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { env, registry } => {
+        Commands::Start {
+            env,
+            registry,
+            refresh_interval_secs,
+        } => {
             let source = resolve_registry(registry.as_deref())?;
-            info!(environment = %env, ?source, "starting oxidizedMCP stdio server");
-            let mut mesh = SkillMesh::new(source);
-            stdio::run_stdio_server(&mut mesh)
+            info!(
+                environment = %env,
+                refresh_secs = refresh_interval_secs,
+                ?source,
+                "starting oxidizedMCP stdio server"
+            );
+
+            let mesh = Arc::new(SkillMesh::new(source));
+            mesh.refresh()
                 .await
-                .context("stdio MCP server failed")?;
+                .context("initial registry refresh failed")?;
+
+            let refresh_handle = if refresh_interval_secs > 0 {
+                Some(spawn_refresh_loop(
+                    mesh.clone(),
+                    Duration::from_secs(refresh_interval_secs),
+                ))
+            } else {
+                None
+            };
+
+            let result = stdio::run_stdio_server(mesh.clone())
+                .await
+                .context("stdio MCP server failed");
+
+            // Stdio loop ended (clean shutdown from EOF, or an error). Either
+            // way, stop the background refresh so the process can exit.
+            if let Some(handle) = refresh_handle {
+                handle.abort();
+            }
+
+            result?;
         }
         Commands::Discover { registry } => {
             let source = resolve_registry(registry.as_deref())?;
-            let mut mesh = SkillMesh::new(source);
+            let mesh = SkillMesh::new(source);
             mesh.refresh().await?;
             let tool_count = mesh.list_tools().len();
             let (skill_count, env) = mesh
@@ -82,7 +121,7 @@ async fn main() -> Result<()> {
         }
         Commands::ListTools { registry } => {
             let source = resolve_registry(registry.as_deref())?;
-            let mut mesh = SkillMesh::new(source);
+            let mesh = SkillMesh::new(source);
             mesh.refresh().await?;
             for tool in mesh.list_tools() {
                 println!("{} — {}", tool.name, tool.description);
@@ -91,6 +130,29 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Spawn a background task that re-fetches the registry on a fixed interval.
+/// The task survives transient errors (logs and continues), so a flaky network
+/// or a briefly-unavailable registry endpoint never kills the proxy.
+fn spawn_refresh_loop(mesh: Arc<SkillMesh>, interval: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // First tick fires immediately; skip it so we don't refresh twice
+        // back-to-back with the initial refresh the caller already did.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match mesh.refresh().await {
+                Ok(()) => {
+                    info!(tools = mesh.list_tools().len(), "registry refreshed");
+                }
+                Err(e) => {
+                    warn!(error = %e, "registry refresh failed; keeping previous snapshot");
+                }
+            }
+        }
+    })
 }
 
 fn resolve_registry(explicit: Option<&Path>) -> Result<RegistrySource> {

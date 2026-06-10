@@ -2,18 +2,21 @@
 
 use anyhow::Result;
 use oxidized_mcp_core::{
-    JsonRpcRequest, JsonRpcResponse, MCP_PROTOCOL_VERSION, SkillMesh, ToolCallParams,
-    ToolsListResult,
+    JsonRpcRequest, JsonRpcResponse, SkillMesh, ToolCallParams, ToolsListResult,
+    MCP_PROTOCOL_VERSION,
 };
 use serde_json::json;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 const SERVER_NAME: &str = "oxidized-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub async fn run_stdio_server(mesh: &mut SkillMesh) -> Result<()> {
-    mesh.refresh().await?;
+/// Run the MCP stdio loop against an already-refreshed mesh. The caller is
+/// responsible for the initial `mesh.refresh()` and for spawning any background
+/// refresh task — this function stays focused on the JSON-RPC transport.
+pub async fn run_stdio_server(mesh: Arc<SkillMesh>) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -45,7 +48,7 @@ pub async fn run_stdio_server(mesh: &mut SkillMesh) -> Result<()> {
             continue;
         }
 
-        let response = handle_request(mesh, request).await;
+        let response = handle_request(&mesh, request).await;
         if let Some(resp) = response {
             write_response(&mut stdout, &resp)?;
         }
@@ -71,12 +74,11 @@ async fn handle_request(mesh: &SkillMesh, request: JsonRpcRequest) -> Option<Jso
         )),
         "notifications/initialized" => None,
         "tools/list" => {
-            let tools = mesh.list_tools().to_vec();
+            let tools = mesh.list_tools();
             Some(JsonRpcResponse::ok(
                 id,
-                serde_json::to_value(ToolsListResult { tools }).unwrap_or_else(|e| {
-                    json!({ "error": e.to_string() })
-                }),
+                serde_json::to_value(ToolsListResult { tools })
+                    .unwrap_or_else(|e| json!({ "error": e.to_string() })),
             ))
         }
         "tools/call" => {
@@ -103,16 +105,17 @@ async fn handle_request(mesh: &SkillMesh, request: JsonRpcRequest) -> Option<Jso
             match mesh.call_tool(&params.name, params.arguments).await {
                 Ok(result) => Some(JsonRpcResponse::ok(
                     id,
-                    serde_json::to_value(result).unwrap_or_else(|e| {
-                        json!({ "error": e.to_string() })
-                    }),
+                    serde_json::to_value(result)
+                        .unwrap_or_else(|e| json!({ "error": e.to_string() })),
                 )),
                 Err(e) => {
                     warn!(tool = %params.name, error = %e, "tool call failed");
                     Some(JsonRpcResponse::ok(
                         id,
-                        serde_json::to_value(oxidized_mcp_core::ToolCallResult::error(e.to_string()))
-                            .unwrap_or_else(|_| json!({ "isError": true })),
+                        serde_json::to_value(oxidized_mcp_core::ToolCallResult::error(
+                            e.to_string(),
+                        ))
+                        .unwrap_or_else(|_| json!({ "isError": true })),
                     ))
                 }
             }

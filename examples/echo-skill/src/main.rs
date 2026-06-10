@@ -41,17 +41,17 @@ async fn handle_mcp(Json(req): Json<JsonRpcRequest>) -> Json<JsonRpcResponse> {
             .unwrap(),
         )),
         "tools/call" => {
-            let params: ToolCallParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
-            {
-                Some(p) => p,
-                None => {
-                    return Json(JsonRpcResponse::err(
-                        req.id,
-                        -32602,
-                        "invalid tools/call params",
-                    ));
-                }
-            };
+            let params: ToolCallParams =
+                match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                    Some(p) => p,
+                    None => {
+                        return Json(JsonRpcResponse::err(
+                            req.id,
+                            -32602,
+                            "invalid tools/call params",
+                        ));
+                    }
+                };
 
             if params.name != "echo" {
                 return Json(JsonRpcResponse::err(

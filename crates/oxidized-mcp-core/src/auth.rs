@@ -185,7 +185,10 @@ mod tests {
     fn resolve_defaults_to_none() {
         assert!(matches!(AuthMode::resolve(None, None), AuthMode::None));
         assert!(matches!(AuthMode::resolve(Some(""), None), AuthMode::None));
-        assert!(matches!(AuthMode::resolve(Some("none"), None), AuthMode::None));
+        assert!(matches!(
+            AuthMode::resolve(Some("none"), None),
+            AuthMode::None
+        ));
         assert!(
             matches!(AuthMode::resolve(Some("garbage"), None), AuthMode::None),
             "unknown values must fall back to None, not panic"
@@ -227,7 +230,10 @@ mod tests {
             "/nonexistent/path/to/gcloud-binary",
         );
         let res = auth.bearer_token().await;
-        assert!(res.is_err(), "expected AuthError when gcloud binary is absent");
+        assert!(
+            res.is_err(),
+            "expected AuthError when gcloud binary is absent"
+        );
         match res.unwrap_err() {
             AuthError::GcloudInvoke(_) => {}
             other => panic!("expected GcloudInvoke, got {other:?}"),

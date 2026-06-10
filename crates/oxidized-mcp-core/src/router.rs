@@ -523,7 +523,10 @@ skills:
         mesh.refresh().await.unwrap();
 
         let seen = captured.lock().unwrap().clone();
-        assert!(!seen.is_empty(), "skill server should have received at least one request");
+        assert!(
+            !seen.is_empty(),
+            "skill server should have received at least one request"
+        );
         assert!(
             seen.iter().all(|h| h.is_none()),
             "AuthMode::None must not send an Authorization header, got: {seen:?}"
@@ -572,7 +575,8 @@ skills:
         let seen = captured.lock().unwrap().clone();
         assert!(!seen.is_empty(), "expected at least one outbound request");
         assert!(
-            seen.iter().all(|h| h.as_deref() == Some("Bearer test-id-token-xyz")),
+            seen.iter()
+                .all(|h| h.as_deref() == Some("Bearer test-id-token-xyz")),
             "every outbound request must carry the Bearer token, got: {seen:?}"
         );
     }

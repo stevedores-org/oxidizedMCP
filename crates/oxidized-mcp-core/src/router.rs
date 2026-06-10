@@ -217,6 +217,25 @@ impl SkillMesh {
             .map_err(|e| MeshError::Auth(skill_name.to_string(), e))?
         {
             req = req.bearer_auth(token);
+        } else {
+            // Fall back to Azure AD token if configured
+            let use_azure = std::env::var("OXIDIZED_MCP_USE_AZURE_AD")
+                .map(|v| v == "true")
+                .unwrap_or(false)
+                || std::env::var("OXIDIZED_MCP_ENV")
+                    .map(|v| v == "staging" || v == "production")
+                    .unwrap_or(false);
+
+            if use_azure && endpoint.starts_with("https://") {
+                match self.loader.fetch_azure_token().await {
+                    Ok(token) => {
+                        req = req.header("Authorization", format!("Bearer {token}"));
+                    }
+                    Err(e) => {
+                        return Err(MeshError::Registry(crate::registry::RegistryError::AzureAuth(e)));
+                    }
+                }
+            }
         }
 
         req.send()

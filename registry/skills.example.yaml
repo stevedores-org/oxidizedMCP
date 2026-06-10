@@ -7,8 +7,16 @@ skills:
     endpoint: http://127.0.0.1:9100/mcp
     enabled: true
 
-  # Future: skills discovered from AKS hub registry
-  # - name: github
-  #   description: GitHub API skill (staging)
-  #   endpoint: https://skills.staging.lornu.ai/github/mcp
+  # Lornu AI agent skills backed by lornu.ai-mcp HTTP MCP.
+  # Start lornu-mcp-hub-rs in HTTP mode on port 8080, then enable the
+  # profile that matches the repository workspace you want agents to operate in.
+  #
+  # - name: infra-code
+  #   description: Lornu infra-code agent skill for Crossplane, Flux, ESO, GitOps review, and workspace-safe automation
+  #   endpoint: http://127.0.0.1:8080/mcp
+  #   enabled: true
+  #
+  # - name: gke-fleets
+  #   description: Lornu GKE fleet agent skill for fleet membership, Gateway API, workload identity, and cluster attach workflows
+  #   endpoint: http://127.0.0.1:8080/mcp
   #   enabled: true

@@ -150,9 +150,9 @@ error pointing the user at `gcloud auth login`.
 - [x] **Epic 1.1** — Azure AD OIDC for AKS hub registry
 - [x] **Epic 1.1** — Periodic registry refresh with atomic snapshot swap
 - [x] **Epic 1.1** — `/healthz` + `/readyz` HTTP probes + dockworker.toml manifests
+- [x] **Epic 1.1** — Skill health probes + degraded-skill eviction
 - [x] **Epic 2** — Outbound auth via GCP identity tokens (gcloud-identity mode)
 - [ ] **Epic 1.1** — Per-skill auth (forward IDE bearer or Workload Identity)
-- [ ] **Epic 1.1** — Skill health probes + degraded-skill eviction
 - [ ] **Epic 2** — Workload Identity Federation for cluster-side `oxidized-mcp` (not just developer laptops)
 - [ ] **Epic 2** — OCI skill packaging via dockworker.ai
 - [ ] **Epic 3** — Flux/Crossplane skill registry in the GKE hub

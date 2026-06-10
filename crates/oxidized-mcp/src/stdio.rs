@@ -29,6 +29,10 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub async fn run_stdio_server(mesh: Arc<SkillMesh>, _health: Option<HealthState>) -> Result<()> {
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
+                break;
+            }
+        };
+>>>>>>> origin/feat/healthz-and-dockworker
 
     while let Some(line) = stdin.next_line().await? {
         if line.trim().is_empty() {

@@ -1,7 +1,7 @@
 # Technical Design Document (TDD): `oxidizedMCP` — Sovereign Skill Mesh Proxy (Revised)
 
-**Status**: Active Planning (reopened via [Issue #3](https://github.com/stevedores-org/oxidizedMCP/issues/3))  
-**Supersedes**: High-level hybrid design in [Issue #1](https://github.com/stevedores-org/oxidizedMCP/issues/1)  
+**Status**: Active Planning (reopened via [Issue #3](https://github.com/stevedores-org/oxidizedMCP/issues/3))
+**Supersedes**: High-level hybrid design in [Issue #1](https://github.com/stevedores-org/oxidizedMCP/issues/1)
 **Core Stack**: Rust (`tokio`, `tracing`, `azure_identity`), MCP JSON-RPC 2.0, Azure AKS Hub
 
 ## 1. Executive Summary: Why Planning Reopened

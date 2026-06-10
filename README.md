@@ -99,7 +99,9 @@ skills:
 | `OXIDIZED_MCP_HEALTH_PORT` | TCP port for `/healthz` and `/readyz` (unset = no HTTP probes) |
 | `OXIDIZED_MCP_HEALTH_BIND_ALL` | `"true"` to bind health endpoints on `0.0.0.0` (cluster pods); default loopback |
 
-## Roadmap (from Issue #1)
+## Roadmap
+
+**MVP (shipped)**: stdio proxy, HTTP routing, registry aggregation — see [Issue #1](https://github.com/stevedores-org/oxidizedMCP/issues/1).
 
 - [x] **Epic 1.1** — Rust proxy, dynamic discovery, JSON-RPC routing
 - [x] **Epic 1.1** — Azure AD OIDC for AKS hub registry
@@ -109,6 +111,16 @@ skills:
 - [ ] **Epic 1.1** — Skill health probes + degraded-skill eviction
 - [ ] **Epic 2** — OCI skill packaging via dockworker.ai
 - [ ] **Epic 3** — Flux/Crossplane skill registry in AKS
+
+**Revised blueprint** ([Issue #3](https://github.com/stevedores-org/oxidizedMCP/issues/3), [docs/TDD_REVISED.md](./docs/TDD_REVISED.md)):
+
+| Epic | Issue | Status |
+|------|-------|--------|
+| Protocol Translator (SSE)         | [#4](https://github.com/stevedores-org/oxidizedMCP/issues/4) | Not started (sync HTTP routing done; no SSE plumbing yet) |
+| Zero-Trust Auth (`azure_identity`) | [#5](https://github.com/stevedores-org/oxidizedMCP/issues/5) | Partial (federated client-credentials exchange shipped; `DefaultAzureCredential` refresh loop still pending) |
+| Dynamic Registry + 60s cache       | [#6](https://github.com/stevedores-org/oxidizedMCP/issues/6) | Done (`--refresh-interval-secs`, default 60; needs K8s ConfigMap source next) |
+| Health probes + dockworker.toml    | (n/a)                                                         | Done (PR #11) |
+| Podman local fallback              | [#7](https://github.com/stevedores-org/oxidizedMCP/issues/7) | Not started |
 
 ## License
 

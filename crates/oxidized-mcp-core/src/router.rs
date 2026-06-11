@@ -1,17 +1,27 @@
 //! Aggregates tools/list and routes tools/call to skill HTTP backends.
 
 use crate::auth::{AuthMode, Authenticator};
+use crate::local_runner::{LocalRunError, PodmanRunner};
 use crate::mcp_types::{JsonRpcRequest, JsonRpcResponse, ToolCallResult, ToolDescriptor};
 use crate::registry::{RegistryLoader, RegistrySource, SkillEntry, SkillManifest};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 pub const TOOL_NAMESPACE_SEP: &str = "::";
+
+/// Number of consecutive HTTP failures (per skill) before the router stops
+/// burning the per-call timeout on the cloud endpoint and routes straight to
+/// the local Podman fallback (when an `image` is declared on the skill).
+/// Resets on any successful HTTP call_tool or on the next refresh that
+/// observes the skill Healthy. Three matches "two retries plus the
+/// original" — small enough to recover quickly on a real outage, large
+/// enough that a single transient blip doesn't flip the route.
+pub const CIRCUIT_TRIP_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum MeshError {
@@ -31,6 +41,8 @@ pub enum MeshError {
     Auth(String, #[source] crate::auth::AuthError),
     #[error("skill '{skill}' is unreachable (last error: {last_error})")]
     SkillUnreachable { skill: String, last_error: String },
+    #[error("local Podman fallback for skill '{0}' failed: {1}")]
+    LocalRun(String, #[source] LocalRunError),
 }
 
 /// Health status of a single skill as observed at the last `refresh`.
@@ -51,7 +63,6 @@ pub struct SkillHealth {
     pub tools_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
->>>>>>> origin/feat/skill-health-probes
 }
 
 /// Immutable view of the mesh at one moment. `refresh` builds a new snapshot
@@ -70,6 +81,12 @@ pub struct SkillMesh {
     client: reqwest::Client,
     snapshot: ArcSwap<MeshSnapshot>,
     authenticator: Authenticator,
+    local_runner: PodmanRunner,
+    /// Per-skill consecutive HTTP failure counter. Kept out of `MeshSnapshot`
+    /// because it must mutate on every `call_tool`, while the snapshot is
+    /// rebuilt only on refresh. A `Mutex<HashMap>` is fine at our scales
+    /// (tens of skills, single-digit calls per second per process).
+    circuit: Mutex<HashMap<String, u32>>,
 }
 
 impl SkillMesh {
@@ -82,6 +99,18 @@ impl SkillMesh {
     /// production where skill endpoints sit behind a Gateway that requires
     /// Bearer tokens.
     pub fn with_auth(registry_source: RegistrySource, authenticator: Authenticator) -> Self {
+        Self::with_auth_and_runner(registry_source, authenticator, PodmanRunner::new())
+    }
+
+    /// Like [`Self::with_auth`] but lets the caller inject a [`PodmanRunner`]
+    /// — used by tests to point at a fake podman script without mutating
+    /// `PATH`, and by callers that want to run the fallback through `docker`
+    /// or another OCI-compatible CLI.
+    pub fn with_auth_and_runner(
+        registry_source: RegistrySource,
+        authenticator: Authenticator,
+        local_runner: PodmanRunner,
+    ) -> Self {
         Self {
             loader: RegistryLoader::new(),
             registry_source,
@@ -91,11 +120,17 @@ impl SkillMesh {
                 .expect("reqwest client"),
             snapshot: ArcSwap::from_pointee(MeshSnapshot::default()),
             authenticator,
+            local_runner,
+            circuit: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn authenticator(&self) -> &Authenticator {
         &self.authenticator
+    }
+
+    pub fn local_runner(&self) -> &PodmanRunner {
+        &self.local_runner
     }
 
     /// Re-fetch the registry, re-discover tools, and atomically swap in the
@@ -132,15 +167,7 @@ impl SkillMesh {
         arguments: Value,
     ) -> Result<ToolCallResult, MeshError> {
         let (skill_name, tool_name) = parse_namespaced_tool(namespaced_name)?;
-        // Fast-fail on skills we already know are down — the HTTP attempt
-        // would burn the per-call timeout before returning the same error.
-        if let Some(reason) = self.skill_unreachable_reason(&skill_name) {
-            return Err(MeshError::SkillUnreachable {
-                skill: skill_name,
-                last_error: reason,
-            });
-        }
-        let endpoint = self.resolve_skill_endpoint(&skill_name)?;
+        let skill_entry = self.resolve_skill_entry(&skill_name)?;
 
         let request = JsonRpcRequest {
             jsonrpc: crate::mcp_types::JSONRPC_VERSION.to_string(),
@@ -152,20 +179,167 @@ impl SkillMesh {
             })),
         };
 
-        let response = self.post_json_rpc(&skill_name, &endpoint, &request).await?;
+        let has_local = skill_entry.image.is_some();
+        let breaker_open = self.breaker_is_open(&skill_name);
+
+        // Circuit open + local fallback configured → skip HTTP entirely.
+        // Burning the 60s reqwest timeout on a skill we already know is
+        // returning failures is the single biggest UX hit when the cloud
+        // goes down. If local works, return it; if local can't run, fall
+        // through to a normal HTTP attempt so a recovered endpoint is noticed.
+        if breaker_open && has_local {
+            let image = skill_entry.image.as_deref().expect("has_local");
+            match self.try_local(&skill_name, image, &request).await {
+                Ok(result) => {
+                    info!(
+                        skill = %skill_name,
+                        image = %image,
+                        "circuit open; served call from local Podman fallback"
+                    );
+                    return Ok(result);
+                }
+                Err(e) => {
+                    debug!(
+                        skill = %skill_name,
+                        error = %e,
+                        "local fallback unavailable while breaker open; retrying HTTP"
+                    );
+                }
+            }
+        }
+
+        // No local fallback path AND last refresh marked the skill Down:
+        // surface that immediately. With `image` configured we still attempt
+        // HTTP — the post-failure branch below handles falling over to local.
+        if !has_local {
+            if let Some(reason) = self.skill_unreachable_reason(&skill_name) {
+                return Err(MeshError::SkillUnreachable {
+                    skill: skill_name,
+                    last_error: reason,
+                });
+            }
+        }
+
+        let http_outcome = self
+            .post_json_rpc(&skill_name, &skill_entry.endpoint, &request)
+            .await;
+
+        match http_outcome {
+            Ok(response) => {
+                self.record_http_success(&skill_name);
+                if let Some(err) = response.error {
+                    return Err(MeshError::SkillError(
+                        skill_name.clone(),
+                        format!("{} ({})", err.message, err.code),
+                    ));
+                }
+                let result = response.result.ok_or_else(|| {
+                    MeshError::SkillError(skill_name.clone(), "empty result".into())
+                })?;
+                serde_json::from_value(result)
+                    .map_err(|e| MeshError::SkillError(skill_name, e.to_string()))
+            }
+            Err(http_err) => {
+                self.record_http_failure(&skill_name);
+                if let Some(image) = skill_entry.image.as_deref() {
+                    match self.try_local(&skill_name, image, &request).await {
+                        Ok(result) => {
+                            info!(
+                                skill = %skill_name,
+                                image = %image,
+                                http_error = %http_err,
+                                "HTTP failed; served call from local Podman fallback"
+                            );
+                            return Ok(result);
+                        }
+                        Err(local_err) => {
+                            warn!(
+                                skill = %skill_name,
+                                http_error = %http_err,
+                                local_error = %local_err,
+                                "HTTP and local fallback both failed"
+                            );
+                        }
+                    }
+                }
+                Err(http_err)
+            }
+        }
+    }
+
+    /// Inner helper: runs `podman image exists` then `podman run -i --rm`,
+    /// turns the JSON-RPC response into a [`ToolCallResult`]. Pure mechanics —
+    /// the breaker / logging / fallback policy stays in `call_tool`.
+    async fn try_local(
+        &self,
+        skill_name: &str,
+        image: &str,
+        request: &JsonRpcRequest,
+    ) -> Result<ToolCallResult, MeshError> {
+        match self.local_runner.image_exists(image).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(MeshError::LocalRun(
+                    skill_name.to_string(),
+                    LocalRunError::ImageNotPresent(image.to_string()),
+                ));
+            }
+            Err(e) => return Err(MeshError::LocalRun(skill_name.to_string(), e)),
+        }
+
+        let response = self
+            .local_runner
+            .invoke_stdio(image, request)
+            .await
+            .map_err(|e| MeshError::LocalRun(skill_name.to_string(), e))?;
 
         if let Some(err) = response.error {
             return Err(MeshError::SkillError(
-                skill_name.clone(),
+                skill_name.to_string(),
                 format!("{} ({})", err.message, err.code),
             ));
         }
+        let result = response.result.ok_or_else(|| {
+            MeshError::SkillError(
+                skill_name.to_string(),
+                "empty result from local fallback".into(),
+            )
+        })?;
+        serde_json::from_value(result)
+            .map_err(|e| MeshError::SkillError(skill_name.to_string(), e.to_string()))
+    }
 
-        let result = response
-            .result
-            .ok_or_else(|| MeshError::SkillError(skill_name.clone(), "empty result".into()))?;
+    fn breaker_is_open(&self, skill: &str) -> bool {
+        self.circuit
+            .lock()
+            .expect("circuit mutex poisoned")
+            .get(skill)
+            .copied()
+            .unwrap_or(0)
+            >= CIRCUIT_TRIP_THRESHOLD
+    }
 
-        serde_json::from_value(result).map_err(|e| MeshError::SkillError(skill_name, e.to_string()))
+    fn record_http_success(&self, skill: &str) {
+        self.circuit
+            .lock()
+            .expect("circuit mutex poisoned")
+            .insert(skill.to_string(), 0);
+    }
+
+    fn record_http_failure(&self, skill: &str) {
+        let mut guard = self.circuit.lock().expect("circuit mutex poisoned");
+        *guard.entry(skill.to_string()).or_insert(0) += 1;
+    }
+
+    /// Test helper: peek at the current failure count without resetting it.
+    #[cfg(test)]
+    fn circuit_count(&self, skill: &str) -> u32 {
+        self.circuit
+            .lock()
+            .expect("circuit mutex poisoned")
+            .get(skill)
+            .copied()
+            .unwrap_or(0)
     }
 
     async fn build_snapshot(&self, manifest: SkillManifest) -> MeshSnapshot {
@@ -185,6 +359,15 @@ impl SkillMesh {
                             input_schema: tool.input_schema,
                         });
                     }
+                    // A healthy refresh resets the circuit. Otherwise a
+                    // breaker opened during a brief outage would stick open
+                    // forever — `call_tool` only resets on a real successful
+                    // request, but refresh probes the same endpoint and
+                    // gives us a second signal to clear it.
+                    self.circuit
+                        .lock()
+                        .expect("circuit mutex poisoned")
+                        .insert(skill.name.clone(), 0);
                     health.insert(
                         skill.name.clone(),
                         SkillHealth {
@@ -311,18 +494,20 @@ impl SkillMesh {
             .map_err(|e| MeshError::Http(skill_name.to_string(), e))
     }
 
-    fn resolve_skill_endpoint(&self, name: &str) -> Result<String, MeshError> {
+    /// Clone the active [`SkillEntry`] for `name` out of the current snapshot.
+    /// Cloning is cheap (a handful of small strings) and lets `call_tool`
+    /// drop the snapshot guard before doing async work.
+    fn resolve_skill_entry(&self, name: &str) -> Result<SkillEntry, MeshError> {
         let snapshot = self.snapshot.load();
         let manifest = snapshot
             .manifest
             .as_ref()
             .ok_or_else(|| MeshError::SkillNotFound(name.to_string()))?;
-        let endpoint = manifest
+        let entry = manifest
             .active_skills()
             .find(|s| s.name == name)
-            .map(|s| s.endpoint.clone())
-            .ok_or_else(|| MeshError::SkillNotFound(name.to_string()))?;
-        Ok(endpoint)
+            .cloned();
+        entry.ok_or_else(|| MeshError::SkillNotFound(name.to_string()))
     }
 
     /// Returns Some(last_error) when the skill is known to be Down.
@@ -814,5 +999,272 @@ skills:
                 .all(|h| h.as_deref() == Some("Bearer test-id-token-xyz")),
             "every outbound request must carry the Bearer token, got: {seen:?}"
         );
+    }
+
+    // ---- Podman local fallback (Epic 4 / issue #7) ----
+
+    /// Skill HTTP server that always returns 500 for `tools/call`, and
+    /// counts how many call_tool requests it has actually seen. Used to
+    /// prove that the circuit breaker skips HTTP after the threshold.
+    async fn mock_always_failing_with_counter() -> (
+        String,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app_counter = counter.clone();
+        let app = Router::new().route(
+            "/mcp",
+            post(move |Json(req): Json<JsonRpcRequest>| {
+                let c = app_counter.clone();
+                async move {
+                    if req.method == "tools/list" {
+                        // Allow discovery so the skill registers as Healthy
+                        // initially — the test then exercises call_tool.
+                        return Json(JsonRpcResponse::ok(
+                            req.id,
+                            serde_json::to_value(ToolsListResult {
+                                tools: vec![ToolDescriptor {
+                                    name: "ping".to_string(),
+                                    description: "Ping".to_string(),
+                                    input_schema: json!({}),
+                                }],
+                            })
+                            .unwrap(),
+                        ))
+                        .into_response();
+                    }
+                    c.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(JsonRpcResponse::err(req.id, -32000, "skill down")),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/mcp"), counter, handle)
+    }
+
+    fn fake_podman(script: &str, tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxidized-mcp-router-podman-{tag}-{}", uuid_simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fake-podman");
+        std::fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Fake podman that returns success for `image exists` and emits a
+    /// canned JSON-RPC response for `run -i --rm`. Bumps a counter on
+    /// every `run` invocation so the test can verify the fallback path.
+    fn fake_podman_always_works(counter_path: &std::path::Path) -> std::path::PathBuf {
+        let script = format!(
+            r#"#!/bin/sh
+case "$1" in
+  image)
+    [ "$2" = "exists" ] && exit 0
+    exit 1
+    ;;
+  run)
+    # Bump the run counter so the test can see how many times the
+    # local fallback was actually exercised.
+    count=$(cat "{counter}" 2>/dev/null || echo 0)
+    echo $((count + 1)) > "{counter}"
+    cat > /dev/null
+    printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":"from-podman"}}]}}}}'
+    ;;
+  *) exit 99 ;;
+esac
+"#,
+            counter = counter_path.display()
+        );
+        fake_podman(&script, "always-works")
+    }
+
+    /// When HTTP fails and the manifest declares an `image`, the call_tool
+    /// path falls back to `podman run -i --rm` and returns the local result.
+    /// One HTTP failure also bumps the breaker counter to 1.
+    #[tokio::test]
+    async fn http_failure_falls_back_to_podman_when_image_present() {
+        let (endpoint, _http_count, _handle) = mock_always_failing_with_counter().await;
+        let podman_counter = std::env::temp_dir().join(format!("podman-count-{}", uuid_simple()));
+        let podman_bin = fake_podman_always_works(&podman_counter);
+
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: flaky
+    description: Skill with local fallback
+    endpoint: {endpoint}
+    image: ghcr.io/example/flaky:latest
+"#
+        );
+        let path = write_registry(&yaml, "fallback-basic");
+
+        let mesh = SkillMesh::with_auth_and_runner(
+            RegistrySource::File(path),
+            Authenticator::new(AuthMode::None),
+            PodmanRunner::with_binary(podman_bin.to_string_lossy().into_owned()),
+        );
+        mesh.refresh().await.unwrap();
+
+        let result = mesh
+            .call_tool("flaky::ping", json!({}))
+            .await
+            .expect("HTTP failure must fall over to podman fallback");
+        assert_eq!(result.content[0].text, "from-podman");
+
+        // The breaker has registered exactly one HTTP failure — not yet open.
+        assert_eq!(mesh.circuit_count("flaky"), 1);
+        assert!(!mesh.breaker_is_open("flaky"));
+        let podman_runs = std::fs::read_to_string(&podman_counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        assert_eq!(podman_runs, 1, "expected exactly one fallback podman run");
+    }
+
+    /// After `CIRCUIT_TRIP_THRESHOLD` consecutive HTTP failures, the next
+    /// `call_tool` must bypass HTTP entirely and route straight to podman.
+    /// We assert on the HTTP server's request counter so the bypass is real
+    /// and not just inferred.
+    #[tokio::test]
+    async fn circuit_opens_after_threshold_and_skips_http() {
+        let (endpoint, http_count, _handle) = mock_always_failing_with_counter().await;
+        let podman_counter = std::env::temp_dir().join(format!("podman-count-{}", uuid_simple()));
+        let podman_bin = fake_podman_always_works(&podman_counter);
+
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: flaky
+    description: Skill with local fallback
+    endpoint: {endpoint}
+    image: ghcr.io/example/flaky:latest
+"#
+        );
+        let path = write_registry(&yaml, "circuit-trip");
+
+        let mesh = SkillMesh::with_auth_and_runner(
+            RegistrySource::File(path),
+            Authenticator::new(AuthMode::None),
+            PodmanRunner::with_binary(podman_bin.to_string_lossy().into_owned()),
+        );
+        mesh.refresh().await.unwrap();
+
+        for i in 0..CIRCUIT_TRIP_THRESHOLD {
+            mesh.call_tool("flaky::ping", json!({}))
+                .await
+                .unwrap_or_else(|e| panic!("call {i} should fall back, got {e}"));
+        }
+        assert!(
+            mesh.breaker_is_open("flaky"),
+            "breaker must be open after {CIRCUIT_TRIP_THRESHOLD} failures"
+        );
+        let http_seen_before = http_count.load(Ordering::SeqCst);
+        assert_eq!(
+            http_seen_before, CIRCUIT_TRIP_THRESHOLD as usize,
+            "every pre-trip call should have hit HTTP exactly once"
+        );
+
+        // One more call after the breaker opens — must NOT hit HTTP.
+        let result = mesh.call_tool("flaky::ping", json!({})).await.unwrap();
+        assert_eq!(result.content[0].text, "from-podman");
+        let http_seen_after = http_count.load(Ordering::SeqCst);
+        assert_eq!(
+            http_seen_after, http_seen_before,
+            "open breaker must NOT issue another HTTP request"
+        );
+    }
+
+    /// A successful refresh after the breaker opened must reset the counter,
+    /// so a recovered endpoint goes back to the HTTP path on the next call.
+    #[tokio::test]
+    async fn breaker_resets_on_healthy_refresh() {
+        let (endpoint, down, _handle) = mock_toggleable_skill_server().await;
+        let podman_counter = std::env::temp_dir().join(format!("podman-count-{}", uuid_simple()));
+        let podman_bin = fake_podman_always_works(&podman_counter);
+
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: flaky
+    description: Toggleable
+    endpoint: {endpoint}
+    image: ghcr.io/example/flaky:latest
+"#
+        );
+        let path = write_registry(&yaml, "breaker-reset");
+
+        let mesh = SkillMesh::with_auth_and_runner(
+            RegistrySource::File(path),
+            Authenticator::new(AuthMode::None),
+            PodmanRunner::with_binary(podman_bin.to_string_lossy().into_owned()),
+        );
+        mesh.refresh().await.unwrap();
+
+        // Take the skill down and drive enough call_tool failures to open
+        // the breaker. Each call falls back to podman, but the counter is
+        // what we care about here.
+        down.store(true, Ordering::SeqCst);
+        for _ in 0..CIRCUIT_TRIP_THRESHOLD {
+            let _ = mesh.call_tool("flaky::ping", json!({})).await;
+        }
+        assert!(mesh.breaker_is_open("flaky"));
+
+        // Bring the skill back up and refresh — the breaker must reset.
+        down.store(false, Ordering::SeqCst);
+        mesh.refresh().await.unwrap();
+        assert_eq!(mesh.circuit_count("flaky"), 0);
+        assert!(!mesh.breaker_is_open("flaky"));
+    }
+
+    /// Sanity: without `image`, the old behavior is preserved — an HTTP
+    /// failure surfaces directly to the caller, no fallback attempted.
+    #[tokio::test]
+    async fn http_failure_without_image_returns_http_error() {
+        let (endpoint, _count, _handle) = mock_always_failing_with_counter().await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: cloud-only
+    description: No local fallback
+    endpoint: {endpoint}
+"#
+        );
+        let path = write_registry(&yaml, "no-image");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+
+        let err = mesh
+            .call_tool("cloud-only::ping", json!({}))
+            .await
+            .expect_err("HTTP 500 must propagate when no image is configured");
+        // SkillUnreachable is correct: the refresh just before this call
+        // recorded the skill as Down via tools/list (which 500s too), so
+        // the fast-fail path triggers. The important assertion is that no
+        // LocalRun variant appears — we never tried fallback.
+        match err {
+            MeshError::SkillUnreachable { .. } | MeshError::Http(_, _) => {}
+            MeshError::LocalRun(_, _) => panic!("must not attempt local fallback without image"),
+            other => panic!("expected HTTP-class error, got {other:?}"),
+        }
     }
 }

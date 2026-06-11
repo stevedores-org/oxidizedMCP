@@ -6,11 +6,34 @@ mod stdio;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use oxidized_mcp_core::{AuthMode, Authenticator, RegistrySource, SkillMesh, SkillStatus};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Exit codes for the `health` subcommand. Documented here so CI gates have a
+/// stable contract.
+const EXIT_HEALTHY: u8 = 0;
+const EXIT_SKILL_DOWN: u8 = 2;
+const EXIT_REGISTRY_UNREACHABLE: u8 = 3;
+
+/// `println!`-equivalent that silently exits on `BrokenPipe`. The default
+/// `println!` panics on EPIPE, which would mask a real "skill down" exit
+/// code (2) behind a panic exit code (101) when the user pipes the output
+/// (e.g. `oxidized-mcp health | head`).
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        let mut stdout = std::io::stdout().lock();
+        if let Err(e) = writeln!(stdout, $($arg)*) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(EXIT_HEALTHY as i32);
+            }
+        }
+    }};
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -78,7 +101,7 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("oxidized_mcp=info".parse()?))
         .with_writer(std::io::stderr)
@@ -171,48 +194,59 @@ async fn main() -> Result<()> {
                     )
                 })
                 .unwrap_or((0, String::new()));
-            println!("discovered {tool_count} tools from {skill_count} skills (env: {env})");
+            say!("discovered {tool_count} tools from {skill_count} skills (env: {env})");
         }
         Commands::ListTools { registry } => {
             let source = resolve_registry(registry.as_deref())?;
             let mesh = SkillMesh::new(source);
             mesh.refresh().await?;
             for tool in mesh.list_tools() {
-                println!("{} — {}", tool.name, tool.description);
+                say!("{} — {}", tool.name, tool.description);
             }
         }
         Commands::Health { registry, json } => {
             let source = resolve_registry(registry.as_deref())?;
             let mesh = SkillMesh::new(source);
-            // Refresh ignores transient registry errors so `health` can still
-            // emit the prior snapshot (empty on a cold start) — operators want
-            // to see SOMETHING when triaging an outage.
-            if let Err(e) = mesh.refresh().await {
-                warn!(error = %e, "refresh failed before health probe; showing prior snapshot");
+            // Refresh failures are softened to a warn! so we can still print
+            // the prior snapshot. With a cold-start process there IS no prior
+            // snapshot — that case is detected after rendering and produces
+            // EXIT_REGISTRY_UNREACHABLE rather than the false-green exit 0
+            // an empty BTreeMap would otherwise yield.
+            let refresh_ok = mesh.refresh().await.is_ok();
+            if !refresh_ok {
+                warn!("refresh failed before health probe; showing prior snapshot");
             }
             let health = mesh.health();
             if json {
-                println!("{}", serde_json::to_string_pretty(&health)?);
+                say!("{}", serde_json::to_string_pretty(&health)?);
             } else {
                 print_health_table(&health);
             }
-            // Non-zero exit if any skill is Down — useful for CI gates.
-            if health.values().any(|h| h.status == SkillStatus::Down) {
-                std::process::exit(2);
-            }
+            // Flush before returning; ExitCode return goes through the
+            // runtime teardown but a bare `process::exit` upstream would skip
+            // the BufWriter drop and truncate piped output.
+            let _ = io::stdout().flush();
+            let code = if !refresh_ok && health.is_empty() {
+                EXIT_REGISTRY_UNREACHABLE
+            } else if health.values().any(|h| h.status == SkillStatus::Down) {
+                EXIT_SKILL_DOWN
+            } else {
+                EXIT_HEALTHY
+            };
+            return Ok(ExitCode::from(code));
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_health_table(health: &std::collections::BTreeMap<String, oxidized_mcp_core::SkillHealth>) {
     if health.is_empty() {
-        println!("no skills in registry");
+        say!("no skills in registry");
         return;
     }
     let name_width = health.keys().map(|n| n.len()).max().unwrap_or(4).max(6);
-    println!(
+    say!(
         "{:<name_width$}  {:<8}  {:>6}  LAST ERROR",
         "SKILL",
         "STATUS",
@@ -225,7 +259,7 @@ fn print_health_table(health: &std::collections::BTreeMap<String, oxidized_mcp_c
             SkillStatus::Down => "DOWN",
         };
         let last_error = h.last_error.as_deref().unwrap_or("");
-        println!(
+        say!(
             "{:<name_width$}  {:<8}  {:>6}  {}",
             name,
             status,

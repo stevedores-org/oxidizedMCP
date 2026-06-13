@@ -37,6 +37,12 @@ pub struct SkillEntry {
     pub endpoint: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// OCI image reference for local Podman fallback when `endpoint` is
+    /// unreachable. When set, the router checks `podman image exists <image>`
+    /// and, if present, invokes the skill as `podman run -i --rm <image>`
+    /// over the MCP stdio transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 fn default_true() -> bool {

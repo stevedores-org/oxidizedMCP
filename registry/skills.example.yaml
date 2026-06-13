@@ -6,6 +6,13 @@ skills:
     description: Local echo skill for development
     endpoint: http://127.0.0.1:9100/mcp
     enabled: true
+    # Optional OCI image for local Podman fallback. When the HTTP endpoint
+    # above is unreachable, the router checks `podman image exists <image>`
+    # and, if cached, invokes the skill via `podman run -i --rm <image>`
+    # over the MCP stdio transport. After CIRCUIT_TRIP_THRESHOLD consecutive
+    # HTTP failures the router skips HTTP entirely and goes straight to
+    # podman until the next successful refresh resets the breaker.
+    # image: ghcr.io/example/echo-skill:latest
 
   # Lornu AI agent skills backed by lornu.ai-mcp HTTP MCP.
   # Start lornu-mcp-hub-rs in HTTP mode on port 8080, then enable the

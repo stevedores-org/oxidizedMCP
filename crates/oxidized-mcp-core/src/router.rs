@@ -51,7 +51,6 @@ pub struct SkillHealth {
     pub tools_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
->>>>>>> origin/feat/skill-health-probes
 }
 
 /// Immutable view of the mesh at one moment. `refresh` builds a new snapshot
@@ -296,7 +295,9 @@ impl SkillMesh {
                         req = req.header("Authorization", format!("Bearer {token}"));
                     }
                     Err(e) => {
-                        return Err(MeshError::Registry(crate::registry::RegistryError::AzureAuth(e)));
+                        return Err(MeshError::Registry(
+                            crate::registry::RegistryError::AzureAuth(e),
+                        ));
                     }
                 }
             }

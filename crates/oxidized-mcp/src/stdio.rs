@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use oxidized_mcp_core::{
-    JsonRpcRequest, JsonRpcResponse, MCP_PROTOCOL_VERSION, SkillMesh, ToolCallParams,
-    ToolsListResult,
+    JsonRpcRequest, JsonRpcResponse, SkillMesh, ToolCallParams, ToolsListResult,
+    MCP_PROTOCOL_VERSION,
 };
 use serde_json::json;
 use std::io::{self, BufRead, Write};
@@ -74,9 +74,8 @@ async fn handle_request(mesh: &SkillMesh, request: JsonRpcRequest) -> Option<Jso
             let tools = mesh.list_tools().to_vec();
             Some(JsonRpcResponse::ok(
                 id,
-                serde_json::to_value(ToolsListResult { tools }).unwrap_or_else(|e| {
-                    json!({ "error": e.to_string() })
-                }),
+                serde_json::to_value(ToolsListResult { tools })
+                    .unwrap_or_else(|e| json!({ "error": e.to_string() })),
             ))
         }
         "tools/call" => {
@@ -103,16 +102,17 @@ async fn handle_request(mesh: &SkillMesh, request: JsonRpcRequest) -> Option<Jso
             match mesh.call_tool(&params.name, params.arguments).await {
                 Ok(result) => Some(JsonRpcResponse::ok(
                     id,
-                    serde_json::to_value(result).unwrap_or_else(|e| {
-                        json!({ "error": e.to_string() })
-                    }),
+                    serde_json::to_value(result)
+                        .unwrap_or_else(|e| json!({ "error": e.to_string() })),
                 )),
                 Err(e) => {
                     warn!(tool = %params.name, error = %e, "tool call failed");
                     Some(JsonRpcResponse::ok(
                         id,
-                        serde_json::to_value(oxidized_mcp_core::ToolCallResult::error(e.to_string()))
-                            .unwrap_or_else(|_| json!({ "isError": true })),
+                        serde_json::to_value(oxidized_mcp_core::ToolCallResult::error(
+                            e.to_string(),
+                        ))
+                        .unwrap_or_else(|_| json!({ "isError": true })),
                     ))
                 }
             }

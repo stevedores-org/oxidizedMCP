@@ -64,7 +64,11 @@ impl SkillMesh {
         &self.aggregated_tools
     }
 
-    pub async fn call_tool(&self, namespaced_name: &str, arguments: Value) -> Result<ToolCallResult, MeshError> {
+    pub async fn call_tool(
+        &self,
+        namespaced_name: &str,
+        arguments: Value,
+    ) -> Result<ToolCallResult, MeshError> {
         let (skill_name, tool_name) = parse_namespaced_tool(namespaced_name)?;
         let skill = self.find_skill(&skill_name)?;
 
@@ -94,8 +98,7 @@ impl SkillMesh {
             .result
             .ok_or_else(|| MeshError::SkillError(skill_name.clone(), "empty result".into()))?;
 
-        serde_json::from_value(result)
-            .map_err(|e| MeshError::SkillError(skill_name, e.to_string()))
+        serde_json::from_value(result).map_err(|e| MeshError::SkillError(skill_name, e.to_string()))
     }
 
     async fn rebuild_index(&mut self, manifest: &SkillManifest) -> Result<(), MeshError> {
@@ -106,11 +109,9 @@ impl SkillMesh {
             match self.fetch_skill_tools(skill).await {
                 Ok(tools) => {
                     for tool in tools {
-                        let namespaced = format!("{}{}{}", skill.name, TOOL_NAMESPACE_SEP, tool.name);
-                        index.insert(
-                            namespaced.clone(),
-                            (skill.name.clone(), tool.name.clone()),
-                        );
+                        let namespaced =
+                            format!("{}{}{}", skill.name, TOOL_NAMESPACE_SEP, tool.name);
+                        index.insert(namespaced.clone(), (skill.name.clone(), tool.name.clone()));
                         aggregated.push(ToolDescriptor {
                             name: namespaced,
                             description: format!("{} — {}", skill.description, tool.description),
@@ -127,11 +128,17 @@ impl SkillMesh {
         aggregated.sort_by(|a, b| a.name.cmp(&b.name));
         self.aggregated_tools = aggregated;
         self.tool_index = index;
-        debug!(tool_count = self.aggregated_tools.len(), "skill mesh indexed");
+        debug!(
+            tool_count = self.aggregated_tools.len(),
+            "skill mesh indexed"
+        );
         Ok(())
     }
 
-    async fn fetch_skill_tools(&self, skill: &SkillEntry) -> Result<Vec<ToolDescriptor>, MeshError> {
+    async fn fetch_skill_tools(
+        &self,
+        skill: &SkillEntry,
+    ) -> Result<Vec<ToolDescriptor>, MeshError> {
         let request = JsonRpcRequest {
             jsonrpc: crate::mcp_types::JSONRPC_VERSION.to_string(),
             id: Some(json!(1)),
@@ -155,15 +162,16 @@ impl SkillMesh {
             .result
             .ok_or_else(|| MeshError::SkillError(skill.name.clone(), "empty tools/list".into()))?;
 
-        let tools: Vec<ToolDescriptor> = if let Some(arr) = result.get("tools").and_then(|v| v.as_array()) {
-            arr.iter()
-                .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                .collect()
-        } else {
-            serde_json::from_value(result).map_err(|e| {
-                MeshError::SkillError(skill.name.clone(), format!("invalid tools/list: {e}"))
-            })?
-        };
+        let tools: Vec<ToolDescriptor> =
+            if let Some(arr) = result.get("tools").and_then(|v| v.as_array()) {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            } else {
+                serde_json::from_value(result).map_err(|e| {
+                    MeshError::SkillError(skill.name.clone(), format!("invalid tools/list: {e}"))
+                })?
+            };
 
         Ok(tools)
     }
@@ -173,8 +181,12 @@ impl SkillMesh {
         endpoint: &str,
         request: &JsonRpcRequest,
     ) -> Result<JsonRpcResponse, reqwest::Error> {
-        let use_azure = std::env::var("OXIDIZED_MCP_USE_AZURE_AD").map(|v| v == "true").unwrap_or(false)
-            || std::env::var("OXIDIZED_MCP_ENV").map(|v| v == "staging" || v == "production").unwrap_or(false);
+        let use_azure = std::env::var("OXIDIZED_MCP_USE_AZURE_AD")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+            || std::env::var("OXIDIZED_MCP_ENV")
+                .map(|v| v == "staging" || v == "production")
+                .unwrap_or(false);
 
         let mut req = self.client.post(endpoint).json(request);
 
@@ -184,11 +196,7 @@ impl SkillMesh {
             }
         }
 
-        req.send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
+        req.send().await?.error_for_status()?.json().await
     }
 
     fn find_skill(&self, name: &str) -> Result<&SkillEntry, MeshError> {

@@ -295,7 +295,9 @@ impl SkillMesh {
                         req = req.header("Authorization", format!("Bearer {token}"));
                     }
                     Err(e) => {
-                        return Err(MeshError::Registry(crate::registry::RegistryError::AzureAuth(e)));
+                        return Err(MeshError::Registry(
+                            crate::registry::RegistryError::AzureAuth(e),
+                        ));
                     }
                 }
             }

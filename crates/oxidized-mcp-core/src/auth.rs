@@ -347,11 +347,14 @@ mod azure_tests {
 
     #[tokio::test]
     async fn static_token_returns_without_azure_login() {
-        let _guard = lock();
-        std::env::remove_var("OXIDIZED_MCP_BEARER_TOKEN");
-        std::env::set_var("OXIDIZED_MCP_BEARER_TOKEN", "test-static-token");
-        let broker = AzureAuthBroker::from_env();
-        std::env::remove_var("OXIDIZED_MCP_BEARER_TOKEN");
+        let broker = {
+            let _guard = lock();
+            std::env::remove_var("OXIDIZED_MCP_BEARER_TOKEN");
+            std::env::set_var("OXIDIZED_MCP_BEARER_TOKEN", "test-static-token");
+            let broker = AzureAuthBroker::from_env();
+            std::env::remove_var("OXIDIZED_MCP_BEARER_TOKEN");
+            broker
+        };
 
         let token = broker.bearer_token().await.unwrap();
         assert_eq!(token, "test-static-token");

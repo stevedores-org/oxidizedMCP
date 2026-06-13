@@ -6,7 +6,12 @@ pub mod mcp_types;
 pub mod registry;
 pub mod router;
 
-pub use auth::{AuthError, AuthMode, Authenticator};
+#[cfg(test)]
+mod test_helpers;
+
+pub use auth::{
+    AuthError, AuthMode, Authenticator, AzureAuthBroker, AzureAuthError, AZ_LOGIN_HINT,
+};
 pub use local_runner::{LocalRunError, PodmanRunner};
 pub use mcp_types::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolCallResult,

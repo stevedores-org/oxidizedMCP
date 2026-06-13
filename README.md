@@ -122,6 +122,9 @@ skills:
 | `OXIDIZED_MCP_HEALTH_BIND_ALL` | `"true"` to bind health endpoints on `0.0.0.0` (cluster pods); default loopback |
 | `OXIDIZED_MCP_AUTH_MODE` | Outbound-call auth: `none` (default), or `gcloud-identity` for GKE Gateway / IAP backends |
 | `OXIDIZED_MCP_AUTH_AUDIENCE` | Optional `--audiences` flag for `gcloud auth print-identity-token` |
+| `OXIDIZED_MCP_USE_AZURE_AD` | Force Entra ID auth on HTTPS hub requests (`true`) |
+| `OXIDIZED_MCP_AZURE_RESOURCE` / `OXIDIZED_MCP_AZURE_SCOPE` | Token scope (default `https://management.azure.com/.default`) |
+| `OXIDIZED_MCP_BEARER_TOKEN` | Static bearer override (CI/tests; skips `az login`) |
 
 ### Authenticating to GKE Gateway / IAP backends
 
@@ -135,12 +138,16 @@ export OXIDIZED_MCP_AUTH_AUDIENCE=https://api.lornu.ai     # whatever the Gatewa
 
 oxidizedMCP shells out to `gcloud auth print-identity-token` and attaches the
 result as `Authorization: Bearer …` on every outbound `tools/list` and
-`tools/call`. Tokens are cached in-process for ~55 minutes (gcloud ID-token
-lifetime is 60). **No static secrets touch disk** — the developer's existing
-`gcloud auth login` session is the only credential surface.
+`tools/call`. Tokens are cached in-process for ~55 minutes.
 
-If `gcloud` is missing or the session has expired, requests fail with a clear
-error pointing the user at `gcloud auth login`.
+### Azure authentication (Epic 2 / Issue #5)
+
+When `OXIDIZED_MCP_ENV=staging|production` or `OXIDIZED_MCP_USE_AZURE_AD=true`, the proxy attaches `Authorization: Bearer <token>` on all **HTTPS** registry and skill requests via `azure_identity`:
+
+- **Local dev**: `DeveloperToolsCredential` (`az login` / `azd auth login`)
+- **Kubernetes**: `WorkloadIdentityCredential` when `AZURE_FEDERATED_TOKEN_FILE` is set
+- **Token refresh**: SDK-managed cache + proactive 5-minute background refresh loop
+- **On failure**: MCP errors include `Run az login to refresh your Azure CLI session`
 
 ## Roadmap
 
@@ -163,10 +170,10 @@ error pointing the user at `gcloud auth login`.
 | Epic | Issue | Status |
 |------|-------|--------|
 | Protocol Translator (SSE)         | [#4](https://github.com/stevedores-org/oxidizedMCP/issues/4) | Not started (sync HTTP routing done; no SSE plumbing yet) |
-| Zero-Trust Auth (`azure_identity`) | [#5](https://github.com/stevedores-org/oxidizedMCP/issues/5) | Partial (federated client-credentials exchange shipped; `DefaultAzureCredential` refresh loop still pending) |
+| Zero-Trust Auth (`azure_identity`) | [#5](https://github.com/stevedores-org/oxidizedMCP/issues/5) | **Rust done** — ingress JWT validation remains infra |
 | Dynamic Registry + 60s cache       | [#6](https://github.com/stevedores-org/oxidizedMCP/issues/6) | Done (`--refresh-interval-secs`, default 60; needs K8s ConfigMap source next) |
 | Health probes + dockworker.toml    | (n/a)                                                         | Done (PR #11) |
-| Podman local fallback              | [#7](https://github.com/stevedores-org/oxidizedMCP/issues/7) | Not started |
+| Podman local fallback              | [#7](https://github.com/stevedores-org/oxidizedMCP/issues/7) | Done (Epic 4) |
 
 ## License
 

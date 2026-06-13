@@ -5,7 +5,9 @@ mod stdio;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use oxidized_mcp_core::{AuthMode, Authenticator, RegistrySource, SkillMesh, SkillStatus};
+use oxidized_mcp_core::{
+    AuthMode, Authenticator, AzureAuthBroker, RegistrySource, SkillMesh, SkillStatus,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,6 +118,15 @@ async fn main() -> Result<()> {
                 .await
                 .context("initial registry refresh failed")?;
 
+            let auth_refresh_handle = if mesh.azure().is_enabled() {
+                Some(AzureAuthBroker::spawn_refresh_loop(
+                    mesh.azure(),
+                    Duration::from_secs(300),
+                ))
+            } else {
+                None
+            };
+
             let refresh_handle = if refresh_interval_secs > 0 {
                 Some(spawn_refresh_loop(
                     mesh.clone(),
@@ -147,6 +158,9 @@ async fn main() -> Result<()> {
             // Stdio loop ended (clean shutdown from EOF, or an error). Either
             // way, stop the background refresh + health server so the process
             // can exit.
+            if let Some(handle) = auth_refresh_handle {
+                handle.abort();
+            }
             if let Some(handle) = refresh_handle {
                 handle.abort();
             }

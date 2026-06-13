@@ -8,7 +8,7 @@ Single MCP proxy for all Lornu skills. IDEs talk to `oxidized-mcp` over stdio; t
 
 | Path | Purpose |
 |------|---------|
-| `crates/oxidized-mcp-core` | Registry, discovery, routing |
+| `crates/oxidized-mcp-core` | Registry, discovery, routing, Azure auth broker |
 | `crates/oxidized-mcp` | CLI + stdio MCP server |
 | `examples/echo-skill` | Local dev skill template |
 | `registry/skills.yaml` | Default local manifest |

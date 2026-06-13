@@ -1,6 +1,6 @@
 //! Aggregates tools/list and routes tools/call to skill HTTP backends.
 
-use crate::auth::{AuthMode, Authenticator};
+use crate::auth::{AuthMode, Authenticator, AzureAuthBroker, AzureAuthError};
 use crate::local_runner::{LocalRunError, PodmanRunner};
 use crate::mcp_types::{JsonRpcRequest, JsonRpcResponse, ToolCallResult, ToolDescriptor};
 use crate::registry::{RegistryLoader, RegistrySource, SkillEntry, SkillManifest};
@@ -39,6 +39,8 @@ pub enum MeshError {
     SkillError(String, String),
     #[error("auth error calling skill '{0}': {1}")]
     Auth(String, #[source] crate::auth::AuthError),
+    #[error("Azure authentication failed: {0}")]
+    AzureAuth(String),
     #[error("skill '{skill}' is unreachable (last error: {last_error})")]
     SkillUnreachable { skill: String, last_error: String },
     #[error("local Podman fallback for skill '{0}' failed: {1}")]
@@ -80,6 +82,7 @@ pub struct SkillMesh {
     registry_source: RegistrySource,
     client: reqwest::Client,
     snapshot: ArcSwap<MeshSnapshot>,
+    azure: Arc<AzureAuthBroker>,
     authenticator: Authenticator,
     local_runner: PodmanRunner,
     /// Per-skill consecutive HTTP failure counter. Kept out of `MeshSnapshot`
@@ -111,18 +114,24 @@ impl SkillMesh {
         authenticator: Authenticator,
         local_runner: PodmanRunner,
     ) -> Self {
+        let azure = Arc::new(AzureAuthBroker::from_env());
         Self {
-            loader: RegistryLoader::new(),
+            loader: RegistryLoader::new(azure.clone()),
             registry_source,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .expect("reqwest client"),
             snapshot: ArcSwap::from_pointee(MeshSnapshot::default()),
+            azure,
             authenticator,
             local_runner,
             circuit: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn azure(&self) -> Arc<AzureAuthBroker> {
+        self.azure.clone()
     }
 
     pub fn authenticator(&self) -> &Authenticator {
@@ -464,27 +473,13 @@ impl SkillMesh {
             .map_err(|e| MeshError::Auth(skill_name.to_string(), e))?
         {
             req = req.bearer_auth(token);
-        } else {
-            // Fall back to Azure AD token if configured
-            let use_azure = std::env::var("OXIDIZED_MCP_USE_AZURE_AD")
-                .map(|v| v == "true")
-                .unwrap_or(false)
-                || std::env::var("OXIDIZED_MCP_ENV")
-                    .map(|v| v == "staging" || v == "production")
-                    .unwrap_or(false);
-
-            if use_azure && endpoint.starts_with("https://") {
-                match self.loader.fetch_azure_token().await {
-                    Ok(token) => {
-                        req = req.header("Authorization", format!("Bearer {token}"));
-                    }
-                    Err(e) => {
-                        return Err(MeshError::Registry(
-                            crate::registry::RegistryError::AzureAuth(e),
-                        ));
-                    }
-                }
-            }
+        } else if self.azure.should_authenticate(endpoint) {
+            let header = self
+                .azure
+                .authorization_header()
+                .await
+                .map_err(|e| MeshError::AzureAuth(azure_auth_message(e)))?;
+            req = req.header("Authorization", header);
         }
 
         req.send()
@@ -527,6 +522,10 @@ impl SkillMesh {
             None
         }
     }
+}
+
+fn azure_auth_message(err: AzureAuthError) -> String {
+    AzureAuthBroker::user_facing_message(&err)
 }
 
 pub fn parse_namespaced_tool(name: &str) -> Result<(String, String), MeshError> {

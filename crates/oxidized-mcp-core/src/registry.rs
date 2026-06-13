@@ -37,6 +37,7 @@ pub struct SkillEntry {
     pub endpoint: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    pub image: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -297,4 +298,3 @@ skills:
         }
     }
 }
-

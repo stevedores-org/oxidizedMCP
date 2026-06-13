@@ -1,6 +1,7 @@
 //! oxidizedMCP core — registry, discovery, and skill routing.
 
 pub mod auth;
+pub mod local_runner;
 pub mod mcp_types;
 pub mod registry;
 pub mod router;

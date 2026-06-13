@@ -6,3 +6,5 @@
 *.log
 .env
 .lornu/
+.local-ci-cache
+

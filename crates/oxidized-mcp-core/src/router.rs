@@ -51,7 +51,6 @@ pub struct SkillHealth {
     pub tools_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
->>>>>>> origin/feat/skill-health-probes
 }
 
 /// Immutable view of the mesh at one moment. `refresh` builds a new snapshot
@@ -132,15 +131,8 @@ impl SkillMesh {
         arguments: Value,
     ) -> Result<ToolCallResult, MeshError> {
         let (skill_name, tool_name) = parse_namespaced_tool(namespaced_name)?;
-        // Fast-fail on skills we already know are down — the HTTP attempt
-        // would burn the per-call timeout before returning the same error.
-        if let Some(reason) = self.skill_unreachable_reason(&skill_name) {
-            return Err(MeshError::SkillUnreachable {
-                skill: skill_name,
-                last_error: reason,
-            });
-        }
-        let endpoint = self.resolve_skill_endpoint(&skill_name)?;
+        let skill_entry = self.find_skill(&skill_name);
+        let local_image = skill_entry.as_ref().and_then(|s| s.image.clone());
 
         let request = JsonRpcRequest {
             jsonrpc: crate::mcp_types::JSONRPC_VERSION.to_string(),
@@ -152,20 +144,104 @@ impl SkillMesh {
             })),
         };
 
-        let response = self.post_json_rpc(&skill_name, &endpoint, &request).await?;
-
-        if let Some(err) = response.error {
-            return Err(MeshError::SkillError(
-                skill_name.clone(),
-                format!("{} ({})", err.message, err.code),
-            ));
+        // If the skill is known to be Down (due to a previous failed probe or call)
+        if let Some(reason) = self.skill_unreachable_reason(&skill_name) {
+            if let Some(ref image) = local_image {
+                if crate::local_runner::has_local_image(image).await {
+                    match crate::local_runner::run_local_mcp(image, &request).await {
+                        Ok(response) => {
+                            if let Some(err) = response.error {
+                                return Err(MeshError::SkillError(
+                                    skill_name.clone(),
+                                    format!("{} ({})", err.message, err.code),
+                                ));
+                            }
+                            let result = response.result.ok_or_else(|| {
+                                MeshError::SkillError(skill_name.clone(), "empty result".into())
+                            })?;
+                            return serde_json::from_value(result)
+                                .map_err(|e| MeshError::SkillError(skill_name, e.to_string()));
+                        }
+                        Err(e) => {
+                            return Err(MeshError::SkillUnreachable {
+                                skill: skill_name,
+                                last_error: format!(
+                                    "Cloud is down: {reason}. Local fallback runner error: {e}"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            return Err(MeshError::SkillUnreachable {
+                skill: skill_name,
+                last_error: reason,
+            });
         }
 
-        let result = response
-            .result
-            .ok_or_else(|| MeshError::SkillError(skill_name.clone(), "empty result".into()))?;
+        let endpoint = self.resolve_skill_endpoint(&skill_name)?;
 
-        serde_json::from_value(result).map_err(|e| MeshError::SkillError(skill_name, e.to_string()))
+        // Try calling the HTTP cloud endpoint
+        match self.post_json_rpc(&skill_name, &endpoint, &request).await {
+            Ok(response) => {
+                if let Some(err) = response.error {
+                    return Err(MeshError::SkillError(
+                        skill_name.clone(),
+                        format!("{} ({})", err.message, err.code),
+                    ));
+                }
+                let result = response.result.ok_or_else(|| {
+                    MeshError::SkillError(skill_name.clone(), "empty result".into())
+                })?;
+                serde_json::from_value(result)
+                    .map_err(|e| MeshError::SkillError(skill_name, e.to_string()))
+            }
+            Err(e) => {
+                let is_timeout_or_conn = match &e {
+                    MeshError::Http(_, req_err) => req_err.is_timeout() || req_err.is_connect(),
+                    _ => false,
+                };
+
+                if is_timeout_or_conn {
+                    let err_msg = e.to_string();
+                    // Trip circuit breaker
+                    self.mark_skill_down(&skill_name, err_msg.clone());
+
+                    if let Some(ref image) = local_image {
+                        if crate::local_runner::has_local_image(image).await {
+                            match crate::local_runner::run_local_mcp(image, &request).await {
+                                Ok(response) => {
+                                    if let Some(err) = response.error {
+                                        return Err(MeshError::SkillError(
+                                            skill_name.clone(),
+                                            format!("{} ({})", err.message, err.code),
+                                        ));
+                                    }
+                                    let result = response.result.ok_or_else(|| {
+                                        MeshError::SkillError(
+                                            skill_name.clone(),
+                                            "empty result".into(),
+                                        )
+                                    })?;
+                                    return serde_json::from_value(result).map_err(|e| {
+                                        MeshError::SkillError(skill_name, e.to_string())
+                                    });
+                                }
+                                Err(local_err) => {
+                                    return Err(MeshError::SkillUnreachable {
+                                        skill: skill_name,
+                                        last_error: format!(
+                                            "Cloud request failed (timeout/conn): {err_msg}. Local fallback runner error: {local_err}"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn build_snapshot(&self, manifest: SkillManifest) -> MeshSnapshot {
@@ -196,15 +272,74 @@ impl SkillMesh {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    warn!(skill = %skill.name, error = %err_str, "skill probe failed; marking Down");
-                    health.insert(
-                        skill.name.clone(),
-                        SkillHealth {
-                            status: SkillStatus::Down,
-                            tools_count: 0,
-                            last_error: Some(err_str),
-                        },
-                    );
+                    warn!(skill = %skill.name, error = %err_str, "skill probe failed; checking local fallback");
+
+                    let mut local_fallback_succeeded = false;
+                    if let Some(ref image) = skill.image {
+                        if crate::local_runner::has_local_image(image).await {
+                            let request = JsonRpcRequest {
+                                jsonrpc: crate::mcp_types::JSONRPC_VERSION.to_string(),
+                                id: Some(json!(1)),
+                                method: "tools/list".to_string(),
+                                params: None,
+                            };
+                            match crate::local_runner::run_local_mcp(image, &request).await {
+                                Ok(response) => {
+                                    if let Some(result) = response.result {
+                                        let tools: Vec<ToolDescriptor> = if let Some(arr) =
+                                            result.get("tools").and_then(|v| v.as_array())
+                                        {
+                                            arr.iter()
+                                                .filter_map(|v| {
+                                                    serde_json::from_value(v.clone()).ok()
+                                                })
+                                                .collect()
+                                        } else {
+                                            serde_json::from_value(result).unwrap_or_default()
+                                        };
+                                        let tools_count = tools.len();
+                                        for tool in tools {
+                                            let namespaced = format!(
+                                                "{}{}{}",
+                                                skill.name, TOOL_NAMESPACE_SEP, tool.name
+                                            );
+                                            aggregated.push(ToolDescriptor {
+                                                name: namespaced,
+                                                description: format!(
+                                                    "{} (local fallback) — {}",
+                                                    skill.description, tool.description
+                                                ),
+                                                input_schema: tool.input_schema,
+                                            });
+                                        }
+                                        health.insert(
+                                            skill.name.clone(),
+                                            SkillHealth {
+                                                status: SkillStatus::Down,
+                                                tools_count,
+                                                last_error: Some(format!("Cloud probe failed: {err_str}. Operating in local fallback mode.")),
+                                            },
+                                        );
+                                        local_fallback_succeeded = true;
+                                    }
+                                }
+                                Err(local_err) => {
+                                    warn!(skill = %skill.name, error = %local_err, "Local fallback probe failed");
+                                }
+                            }
+                        }
+                    }
+
+                    if !local_fallback_succeeded {
+                        health.insert(
+                            skill.name.clone(),
+                            SkillHealth {
+                                status: SkillStatus::Down,
+                                tools_count: 0,
+                                last_error: Some(err_str),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -296,7 +431,9 @@ impl SkillMesh {
                         req = req.header("Authorization", format!("Bearer {token}"));
                     }
                     Err(e) => {
-                        return Err(MeshError::Registry(crate::registry::RegistryError::AzureAuth(e)));
+                        return Err(MeshError::Registry(
+                            crate::registry::RegistryError::AzureAuth(e),
+                        ));
                     }
                 }
             }
@@ -342,6 +479,44 @@ impl SkillMesh {
         } else {
             None
         }
+    }
+
+    fn find_skill(&self, name: &str) -> Option<SkillEntry> {
+        let snapshot = self.snapshot.load();
+        let manifest = snapshot.manifest.as_ref()?;
+        let res = manifest.active_skills().find(|s| s.name == name).cloned();
+        res
+    }
+
+    fn mark_skill_down(&self, name: &str, error: String) {
+        let current = self.snapshot.load();
+        if let Some(health) = current.health.get(name) {
+            if health.status == SkillStatus::Down {
+                return;
+            }
+        }
+
+        let mut health = current.health.clone();
+        if let Some(h) = health.get_mut(name) {
+            h.status = SkillStatus::Down;
+            h.last_error = Some(error);
+        } else {
+            health.insert(
+                name.to_string(),
+                SkillHealth {
+                    status: SkillStatus::Down,
+                    tools_count: 0,
+                    last_error: Some(error),
+                },
+            );
+        }
+
+        let new_snapshot = MeshSnapshot {
+            manifest: current.manifest.clone(),
+            aggregated_tools: current.aggregated_tools.clone(),
+            health,
+        };
+        self.snapshot.store(Arc::new(new_snapshot));
     }
 }
 
@@ -814,5 +989,42 @@ skills:
                 .all(|h| h.as_deref() == Some("Bearer test-id-token-xyz")),
             "every outbound request must carry the Bearer token, got: {seen:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_local_fallback_on_unreachable_endpoint() {
+        let yaml = r#"
+version: 1
+environment: test
+skills:
+  - name: fallback-skill
+    description: local fallback test
+    endpoint: http://127.0.0.1:12345/mcp
+    enabled: true
+    image: mock-local-image:fallback
+"#;
+        let path = write_registry(yaml, "fallback");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+
+        // 1. Verify tools are loaded from local OCI fallback
+        let tools = mesh.list_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "fallback-skill::local_ping");
+        assert!(tools[0].description.contains("local fallback"));
+
+        // 2. Verify health is Down
+        let health = mesh.health();
+        assert_eq!(health["fallback-skill"].status, SkillStatus::Down);
+
+        // 3. Verify call_tool routes to local OCI fallback
+        let result = mesh
+            .call_tool("fallback-skill::local_ping", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.content[0].text, "pong from local fallback");
     }
 }

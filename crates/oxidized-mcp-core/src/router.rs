@@ -479,7 +479,9 @@ impl SkillMesh {
                         req = req.header("Authorization", format!("Bearer {token}"));
                     }
                     Err(e) => {
-                        return Err(MeshError::Registry(crate::registry::RegistryError::AzureAuth(e)));
+                        return Err(MeshError::Registry(
+                            crate::registry::RegistryError::AzureAuth(e),
+                        ));
                     }
                 }
             }
@@ -503,10 +505,7 @@ impl SkillMesh {
             .manifest
             .as_ref()
             .ok_or_else(|| MeshError::SkillNotFound(name.to_string()))?;
-        let entry = manifest
-            .active_skills()
-            .find(|s| s.name == name)
-            .cloned();
+        let entry = manifest.active_skills().find(|s| s.name == name).cloned();
         entry.ok_or_else(|| MeshError::SkillNotFound(name.to_string()))
     }
 
@@ -1006,11 +1005,8 @@ skills:
     /// Skill HTTP server that always returns 500 for `tools/call`, and
     /// counts how many call_tool requests it has actually seen. Used to
     /// prove that the circuit breaker skips HTTP after the threshold.
-    async fn mock_always_failing_with_counter() -> (
-        String,
-        Arc<AtomicUsize>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    async fn mock_always_failing_with_counter(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let counter = Arc::new(AtomicUsize::new(0));
         let app_counter = counter.clone();
         let app = Router::new().route(
@@ -1053,7 +1049,10 @@ skills:
     }
 
     fn fake_podman(script: &str, tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("oxidized-mcp-router-podman-{tag}-{}", uuid_simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "oxidized-mcp-router-podman-{tag}-{}",
+            uuid_simple()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("fake-podman");
         std::fs::write(&path, script).unwrap();

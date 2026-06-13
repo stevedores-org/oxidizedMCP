@@ -168,7 +168,10 @@ esac
 "#;
         let bin = fake_podman(script, "exists-true");
         let runner = PodmanRunner::with_binary(bin.to_string_lossy().into_owned());
-        assert!(runner.image_exists("ghcr.io/example/skill:latest").await.unwrap());
+        assert!(runner
+            .image_exists("ghcr.io/example/skill:latest")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -183,8 +186,7 @@ exit 1
 
     #[tokio::test]
     async fn image_exists_errors_when_binary_missing() {
-        let runner =
-            PodmanRunner::with_binary("/definitely/not/a/real/path/to/podman".to_string());
+        let runner = PodmanRunner::with_binary("/definitely/not/a/real/path/to/podman".to_string());
         let err = runner
             .image_exists("anything")
             .await

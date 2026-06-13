@@ -166,17 +166,19 @@ skills:
 
     #[tokio::test]
     async fn load_url_with_static_bearer_token() {
-        let _guard = crate::test_helpers::test_env::lock();
-        std::env::remove_var("OXIDIZED_MCP_BEARER_TOKEN");
-        std::env::remove_var("LORNU_BEARER_TOKEN");
-        std::env::set_var("OXIDIZED_MCP_BEARER_TOKEN", "test-registry-token");
+        let loader = {
+            let _guard = crate::test_helpers::test_env::lock();
+            std::env::remove_var("OXIDIZED_MCP_BEARER_TOKEN");
+            std::env::remove_var("LORNU_BEARER_TOKEN");
+            std::env::set_var("OXIDIZED_MCP_BEARER_TOKEN", "test-registry-token");
 
-        let loader = RegistryLoader::new(Arc::new(AzureAuthBroker::from_env()));
+            let loader = RegistryLoader::new(Arc::new(AzureAuthBroker::from_env()));
+            std::env::remove_var("OXIDIZED_MCP_BEARER_TOKEN");
+            loader
+        };
         // Static token path is exercised; remote fetch may fail DNS — we only
         // verify auth wiring does not require az login when token is set.
         let res = loader.load_url("https://example.com/registry.json").await;
-
-        std::env::remove_var("OXIDIZED_MCP_BEARER_TOKEN");
 
         assert!(res.is_err());
         match res.unwrap_err() {

@@ -538,7 +538,8 @@ impl SkillMesh {
         arguments: Value,
     ) -> Result<SseStream, MeshError> {
         let (skill_name, tool_name) = parse_namespaced_tool(namespaced_name)?;
-        let skill_entry = self.resolve_skill_entry(&skill_name)?;
+        let snapshot = self.snapshot.load_full();
+        let skill_entry = resolve_skill_entry_in(&snapshot, &skill_name)?;
         if !skill_entry.streaming {
             return Err(MeshError::StreamingNotEnabled(skill_name));
         }
@@ -575,7 +576,8 @@ impl SkillMesh {
         let Ok((skill_name, _)) = parse_namespaced_tool(namespaced_name) else {
             return false;
         };
-        self.resolve_skill_entry(&skill_name)
+        let snapshot = self.snapshot.load_full();
+        resolve_skill_entry_in(&snapshot, &skill_name)
             .map(|entry| entry.streaming)
             .unwrap_or(false)
     }

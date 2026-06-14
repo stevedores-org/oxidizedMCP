@@ -59,11 +59,15 @@ pub enum SkillStatus {
 /// from the most recent successful `tools/list`; it stays at the last good
 /// value while the skill is Down so operators can see what the skill used to
 /// expose. `last_error` is populated whenever the latest probe failed.
+///
+/// `#[serde(default)]` on `last_error` lets older JSON payloads (emitted before
+/// this field existed, or by peers that omit it) deserialize cleanly into the
+/// current struct — `skip_serializing_if` alone is one-way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillHealth {
     pub status: SkillStatus,
     pub tools_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
@@ -176,7 +180,12 @@ impl SkillMesh {
         arguments: Value,
     ) -> Result<ToolCallResult, MeshError> {
         let (skill_name, tool_name) = parse_namespaced_tool(namespaced_name)?;
-        let skill_entry = self.resolve_skill_entry(&skill_name)?;
+        // Load the snapshot ONCE so the health fast-fail check (below) and the
+        // endpoint/image resolution share one consistent view and can't
+        // disagree across a concurrent refresh swap — the atomicity guarantee
+        // that motivated ArcSwap.
+        let snapshot = self.snapshot.load_full();
+        let skill_entry = resolve_skill_entry_in(&snapshot, &skill_name)?;
 
         let request = JsonRpcRequest {
             jsonrpc: crate::mcp_types::JSONRPC_VERSION.to_string(),
@@ -221,11 +230,16 @@ impl SkillMesh {
         // surface that immediately. With `image` configured we still attempt
         // HTTP — the post-failure branch below handles falling over to local.
         if !has_local {
-            if let Some(reason) = self.skill_unreachable_reason(&skill_name) {
-                return Err(MeshError::SkillUnreachable {
-                    skill: skill_name,
-                    last_error: reason,
-                });
+            if let Some(health) = snapshot.health.get(&skill_name) {
+                if health.status == SkillStatus::Down {
+                    return Err(MeshError::SkillUnreachable {
+                        skill: skill_name,
+                        last_error: health
+                            .last_error
+                            .clone()
+                            .unwrap_or_else(|| "unknown error".to_string()),
+                    });
+                }
             }
         }
 
@@ -354,6 +368,11 @@ impl SkillMesh {
     async fn build_snapshot(&self, manifest: SkillManifest) -> MeshSnapshot {
         let mut aggregated = Vec::new();
         let mut health = BTreeMap::new();
+        // Capture the previous snapshot so a skill flipping Healthy → Down
+        // can carry forward the last-known `tools_count` (matches the
+        // docstring on SkillHealth promising operators see what the skill
+        // used to expose).
+        let prior = self.snapshot.load_full();
 
         for skill in manifest.active_skills() {
             match self.fetch_skill_tools(skill).await {
@@ -389,11 +408,16 @@ impl SkillMesh {
                 Err(e) => {
                     let err_str = e.to_string();
                     warn!(skill = %skill.name, error = %err_str, "skill probe failed; marking Down");
+                    let prior_tools_count = prior
+                        .health
+                        .get(&skill.name)
+                        .map(|h| h.tools_count)
+                        .unwrap_or(0);
                     health.insert(
                         skill.name.clone(),
                         SkillHealth {
                             status: SkillStatus::Down,
-                            tools_count: 0,
+                            tools_count: prior_tools_count,
                             last_error: Some(err_str),
                         },
                     );
@@ -490,38 +514,22 @@ impl SkillMesh {
             .await
             .map_err(|e| MeshError::Http(skill_name.to_string(), e))
     }
+}
 
-    /// Clone the active [`SkillEntry`] for `name` out of the current snapshot.
-    /// Cloning is cheap (a handful of small strings) and lets `call_tool`
-    /// drop the snapshot guard before doing async work.
-    fn resolve_skill_entry(&self, name: &str) -> Result<SkillEntry, MeshError> {
-        let snapshot = self.snapshot.load();
-        let manifest = snapshot
-            .manifest
-            .as_ref()
-            .ok_or_else(|| MeshError::SkillNotFound(name.to_string()))?;
-        let entry = manifest.active_skills().find(|s| s.name == name).cloned();
-        entry.ok_or_else(|| MeshError::SkillNotFound(name.to_string()))
-    }
-
-    /// Returns Some(last_error) when the skill is known to be Down.
-    /// Returns None when the skill is Healthy or has no recorded health yet
-    /// (e.g. before the first refresh) — the caller proceeds with the HTTP
-    /// attempt in that case, so we never reject calls based on stale absence.
-    fn skill_unreachable_reason(&self, name: &str) -> Option<String> {
-        let snapshot = self.snapshot.load();
-        let health = snapshot.health.get(name)?;
-        if health.status == SkillStatus::Down {
-            Some(
-                health
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "unknown error".to_string()),
-            )
-        } else {
-            None
-        }
-    }
+/// Resolve and clone the active [`SkillEntry`] for `name` out of a borrowed
+/// snapshot. Free function (not `&self`) so `call_tool` can load the snapshot
+/// once and share one consistent view across the health gate and the
+/// endpoint/image resolution. Cloning is cheap (a handful of small strings).
+fn resolve_skill_entry_in(snapshot: &MeshSnapshot, name: &str) -> Result<SkillEntry, MeshError> {
+    let manifest = snapshot
+        .manifest
+        .as_ref()
+        .ok_or_else(|| MeshError::SkillNotFound(name.to_string()))?;
+    manifest
+        .active_skills()
+        .find(|s| s.name == name)
+        .cloned()
+        .ok_or_else(|| MeshError::SkillNotFound(name.to_string()))
 }
 
 fn azure_auth_message(err: AzureAuthError) -> String {
@@ -813,6 +821,12 @@ skills:
         let h = mesh.health();
         assert_eq!(h["flaky"].status, SkillStatus::Down);
         assert!(h["flaky"].last_error.is_some());
+        // tools_count must carry forward the last-known good value when the
+        // skill goes Down, matching the SkillHealth doc-comment promise.
+        assert_eq!(
+            h["flaky"].tools_count, 1,
+            "Down snapshot must preserve last-known tools_count"
+        );
 
         // Recover the skill and refresh — status returns to Healthy.
         down.store(false, Ordering::SeqCst);
@@ -820,6 +834,17 @@ skills:
         let h = mesh.health();
         assert_eq!(h["flaky"].status, SkillStatus::Healthy);
         assert_eq!(h["flaky"].tools_count, 1);
+    }
+
+    /// Older JSON payloads emitted before `last_error` existed must still
+    /// deserialize cleanly (this is the `#[serde(default)]` contract).
+    #[test]
+    fn skill_health_deserializes_without_last_error() {
+        let json = r#"{"status":"healthy","tools_count":3}"#;
+        let h: SkillHealth = serde_json::from_str(json).unwrap();
+        assert_eq!(h.status, SkillStatus::Healthy);
+        assert_eq!(h.tools_count, 3);
+        assert!(h.last_error.is_none());
     }
 
     /// call_tool refuses to issue a network request when the skill is known

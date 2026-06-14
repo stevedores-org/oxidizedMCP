@@ -45,7 +45,8 @@ If AKS hub times out:
 | stdio MCP server | `crates/oxidized-mcp/src/stdio.rs` | Epic 1 | **Done** — SSE streaming + client cancellation implemented (PR #30) |
 | stdio → HTTP routing | `oxidized-mcp-core` router | Epic 1 | **Done** for sync HTTP |
 | `tools/list` aggregation | `SkillMesh` + namespacing | Epic 3 | **Done** locally |
-| Registry URL fetch | `registry.rs` + `--refresh-interval-secs` (default 60) | Epic 3 | **Done** — file/URL sources with periodic refresh |
+| `tools/list` 60s cache | `list_tools_cached()` + `refreshed_at` + `refresh_lock` | Epic 3 | **Done** on `develop` (PR #32) — TTL wired from `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` |
+| Registry URL fetch | `registry.rs` + `--refresh-interval-secs` (default 60) | Epic 3 | **Done** — file/URL sources with periodic + lazy refresh |
 | Azure auth | `azure_identity` (`auth.rs`) + env bearer tokens | Epic 2 | **Rust done** — ingress JWT validation remains infra |
 | Health probes | `--health-port` + `/healthz` / `/readyz` (PR #11) | Epic 1.1 | **Done** |
 | OCI packaging | `dockworker.toml` at workspace root + on echo-skill (PR #11) | Epic 1.1 | **Partial** |

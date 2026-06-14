@@ -29,8 +29,9 @@ A **small Rust binary on the laptop** that does not execute skills — it **disc
 
 ### Skill registry (future: `lornu-ai/skills-registry`)
 
-- K8s ConfigMap or hub API listing `name → endpoint`
-- Consumed by `oxidized-mcp` via `OXIDIZED_MCP_REGISTRY_URL`
+- Hub API or GitOps-published manifest listing `name → endpoint`
+- Consumed by `oxidized-mcp` via `OXIDIZED_MCP_REGISTRY_URL` (manifest JSON) or local `OXIDIZED_MCP_REGISTRY` YAML
+- **Rust client done** (`develop`): periodic refresh, lazy 60s `tools/list` cache, atomic snapshot swap — see [Issue #6](https://github.com/stevedores-org/oxidizedMCP/issues/6)
 
 ## Protocol
 

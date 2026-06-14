@@ -35,7 +35,19 @@ cargo run -p oxidized-mcp -- start --env local
 }
 ```
 
-Point `OXIDIZED_MCP_REGISTRY` at `registry/skills.yaml` or set `OXIDIZED_MCP_REGISTRY_URL` to your GitOps-published manifest.
+Point `OXIDIZED_MCP_REGISTRY` at `registry/skills.yaml` or set `OXIDIZED_MCP_REGISTRY_URL` to your GitOps-published manifest (or, when deployed, the hub skill-registry API).
+
+### Dynamic discovery & `tools/list` cache (Epic 3 / Issue #6)
+
+The stdio server's `tools/list` handler calls `SkillMesh::list_tools_cached()`:
+
+- **Fresh snapshot** — returns the in-memory aggregated tool list with no skill re-probes.
+- **Stale snapshot** — triggers a registry refresh (same path as the background loop), then returns the updated list.
+- **TTL** — defaults to 60 seconds and matches `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` when set to a positive value. Set the interval to `0` to disable both periodic background refresh and time-based lazy refresh (startup refresh only).
+- **Outages** — failed refreshes log a warning and serve the last good snapshot so the IDE stays responsive.
+- **Concurrency** — all refresh paths share a lock so concurrent IDE `tools/list` calls and the background ticker cannot stampede skill backends.
+
+Background `--refresh-interval-secs` (default 60) still runs for health probes and proactive discovery; lazy refresh covers IDE-driven `tools/list` when the snapshot ages out between ticks.
 
 ## Cluster deployment
 
@@ -119,7 +131,7 @@ skills:
 | `OXIDIZED_MCP_REGISTRY` | Path to local manifest YAML |
 | `OXIDIZED_MCP_REGISTRY_URL` | Remote manifest URL (JSON) |
 | `OXIDIZED_MCP_ENV` | Environment label (`local`, `staging`, `production`) |
-| `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` | Re-fetch the registry every N seconds (default `60`; `0` disables) |
+| `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` | Re-fetch the registry every N seconds (default `60`; `0` disables). Also sets the lazy `tools/list` cache TTL in `start` mode. |
 | `OXIDIZED_MCP_HEALTH_PORT` | TCP port for `/healthz` and `/readyz` (unset = no HTTP probes) |
 | `OXIDIZED_MCP_HEALTH_BIND_ALL` | `"true"` to bind health endpoints on `0.0.0.0` (cluster pods); default loopback |
 | `OXIDIZED_MCP_AUTH_MODE` | Outbound-call auth: `none` (default), or `gcloud-identity` for GKE Gateway / IAP backends |
@@ -203,7 +215,7 @@ Implementation: `crates/oxidized-mcp-core/src/local_runner.rs` +
 |------|-------|--------|
 | Protocol Translator (SSE)         | [#4](https://github.com/stevedores-org/oxidizedMCP/issues/4) | **Rust done** (PR #30) — SSE streaming + client cancellation implemented |
 | Zero-Trust Auth (`azure_identity`) | [#5](https://github.com/stevedores-org/oxidizedMCP/issues/5) | **Rust done** — ingress JWT validation remains infra |
-| Dynamic Registry + 60s cache       | [#6](https://github.com/stevedores-org/oxidizedMCP/issues/6) | Done (`--refresh-interval-secs`, default 60; needs K8s ConfigMap source next) |
+| Dynamic Registry + 60s cache       | [#6](https://github.com/stevedores-org/oxidizedMCP/issues/6) | **Rust done** (PR #32) — hub `skill-registry` service + GitOps publish remain |
 | Health probes + dockworker.toml    | (n/a)                                                         | Done (PR #11) |
 | Podman local fallback              | [#7](https://github.com/stevedores-org/oxidizedMCP/issues/7) | Done (Epic 4) |
 

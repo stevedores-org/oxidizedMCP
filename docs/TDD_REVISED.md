@@ -26,7 +26,7 @@ Therefore `oxidizedMCP` must act as:
 
 ### 2.2 Sovereign Authentication (Zero-Secret Local Auth)
 
-- Use `DefaultAzureCredential` from the `azure_identity` crate (hooks into `az login`)
+- Use `DeveloperToolsCredential` / `WorkloadIdentityCredential` from the `azure_identity` crate (hooks into `az login`; Rust SDK maps `DefaultAzureCredential` → developer-tool credentials)
 - Attach short-lived JWT as `Authorization: Bearer <token>` on all AKS hub requests
 - On expiry: return MCP error instructing `az login`
 
@@ -40,25 +40,31 @@ If AKS hub times out:
 
 ## 3. MVP vs Revised TDD (Gap Analysis)
 
-| Capability | MVP (`main`) | Revised TDD | Gap |
-|------------|--------------|-------------|-----|
+| Capability | MVP (`main` + `develop`) | Revised TDD | Gap |
+|------------|--------------------------|-------------|-----|
 | stdio MCP server | `crates/oxidized-mcp/src/stdio.rs` | Epic 1 | **Partial** — no SSE streaming |
 | stdio → HTTP routing | `oxidized-mcp-core` router | Epic 1 | **Done** for sync HTTP |
 | `tools/list` aggregation | `SkillMesh` + namespacing | Epic 3 | **Done** locally |
-| Registry URL fetch | `registry.rs` | Epic 3 | **Partial** — no 60s cache TTL |
-| Azure auth | `az account get-access-token` + env tokens | Epic 2 | **Partial** — needs `azure_identity` + refresh loop |
-| Podman fallback | — | Epic 4 | **Not started** |
+| Registry URL fetch | `registry.rs` + `--refresh-interval-secs` (default 60) | Epic 3 | **Done** — file/URL sources with periodic refresh |
+| Azure auth | `azure_identity` (`auth.rs`) + env bearer tokens | Epic 2 | **Rust done** — ingress JWT validation remains infra |
+| Health probes | `--health-port` + `/healthz` / `/readyz` (PR #11) | Epic 1.1 | **Done** |
+| OCI packaging | `dockworker.toml` at workspace root + on echo-skill (PR #11) | Epic 1.1 | **Partial** |
+| Podman fallback | `local_runner.rs` + router circuit breaker | Epic 4 | **Done** |
 | Hub skill-registry service | — | Epic 3 | **Not started** (`lornu-ai/skills-registry`) |
 | Ingress JWT validation | — | Epic 2 (infra) | **Not started** |
 
-## 4. Target Module Layout
+## 4. Target Module Layout (proposed — not yet committed)
+
+The names below are aspirational placeholders. Don't open PRs that create these
+files purely on the strength of this table — open them as part of the epic they
+serve, with the abstractions worked out in code review.
 
 | Module | Crate path | Responsibility |
 |--------|------------|----------------|
 | Proxy | `crates/oxidized-mcp-core/src/proxy.rs` | stdio ↔ HTTP/SSE translation |
-| Auth | `crates/oxidized-mcp-core/src/auth.rs` | `azure_identity` token broker |
+| Auth | `crates/oxidized-mcp-core/src/auth.rs` | `azure_identity` token broker (alongside the existing federated client-credentials flow in `registry.rs`) |
 | Local runner | `crates/oxidized-mcp-core/src/local_runner.rs` | Podman exec fallback |
-| Registry service | `lornu-ai/skills-registry/` | FastAPI hub discovery API |
+| Registry service | `lornu-ai/skills-registry/` | hub discovery API (language TBD; rule of thumb [Rust + cargo + nix flake](https://github.com/lornu-ai/six-files/blob/main/docs/BIBLE.md)) |
 
 ## 5. Agile Backlog (Epics)
 
@@ -78,4 +84,4 @@ Full user stories and acceptance criteria: [Issue #3](https://github.com/stevedo
 | **stevedores-org/oxidizedMCP** (OSS) | Generic skill mesh proxy, registry format, protocol translation |
 | **lornu-ai/lornu.ai-mcp** (private) | Secrets masking, Lornu-native hub skills, private endpoints |
 
-`lornu-mesh` composes `oxidized-mcp-core` (git dep) with the in-process Lornu hub. OSS proxy evolution does not block private-layer work.
+`lornu-hub` (the binary shipped by `lornu-ai/lornu.ai-mcp/packages/lornu-mcp-hub-rs`) composes `oxidized-mcp-core` (git dep) with the in-process Lornu hub. OSS proxy evolution does not block private-layer work.

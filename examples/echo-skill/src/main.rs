@@ -15,7 +15,25 @@ async fn main() {
         .init();
 
     let app = Router::new().route("/mcp", post(handle_mcp));
-    let addr = SocketAddr::from(([127, 0, 0, 1], 9100));
+    // Bind 0.0.0.0 by default so the OCI image (dockworker.toml) is reachable
+    // from oxidized-mcp running outside the container. Override with
+    // ECHO_SKILL_BIND=127.0.0.1:9100 for tightened laptop dev when you don't
+    // want the listener on every interface. Bad values fall back to the
+    // default with a warning so a typo never silently leaves you on 0.0.0.0
+    // when you thought you'd locked it down.
+    let default_addr = SocketAddr::from(([0, 0, 0, 0], 9100));
+    let addr = match std::env::var("ECHO_SKILL_BIND") {
+        Ok(raw) => match raw.parse::<SocketAddr>() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    "ECHO_SKILL_BIND={raw:?} could not be parsed as host:port ({e}); falling back to {default_addr}"
+                );
+                default_addr
+            }
+        },
+        Err(_) => default_addr,
+    };
     tracing::info!("echo-skill listening on http://{addr}/mcp");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

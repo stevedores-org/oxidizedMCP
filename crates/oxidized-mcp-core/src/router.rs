@@ -15,9 +15,11 @@ use tracing::{debug, info, warn};
 
 pub const TOOL_NAMESPACE_SEP: &str = "::";
 
-/// Maximum age of the aggregated `tools/list` snapshot before
-/// [`SkillMesh::list_tools_cached`] triggers a refresh. Matches the default
-/// `--refresh-interval-secs` / `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` value.
+/// Default maximum age of the aggregated `tools/list` snapshot before
+/// [`SkillMesh::list_tools_cached`] triggers a refresh. The `start` command
+/// wires this from `--refresh-interval-secs` / `OXIDIZED_MCP_REFRESH_INTERVAL_SECS`
+/// via [`SkillMesh::with_tools_list_cache_ttl_secs`]; this constant is the
+/// fallback for other entrypoints (`discover`, `list-tools`, tests).
 pub const TOOLS_LIST_CACHE_TTL_SECS: u64 = 60;
 
 /// Number of consecutive HTTP failures (per skill) before the router stops
@@ -101,8 +103,13 @@ pub struct SkillMesh {
     /// rebuilt only on refresh. A `Mutex<HashMap>` is fine at our scales
     /// (tens of skills, single-digit calls per second per process).
     circuit: Mutex<HashMap<String, u32>>,
-    /// Serializes on-demand refreshes triggered by [`Self::list_tools_cached`]
-    /// so concurrent IDE `tools/list` calls don't stampede skill backends.
+    /// Maximum age of the aggregated snapshot before [`Self::list_tools_cached`]
+    /// triggers a refresh. Set from `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` in the
+    /// stdio server; defaults to [`TOOLS_LIST_CACHE_TTL_SECS`].
+    tools_list_cache_ttl_secs: u64,
+    /// Serializes all registry refreshes (background loop, explicit
+    /// [`Self::refresh`], and on-demand [`Self::list_tools_cached`]) so
+    /// concurrent callers don't stampede skill backends.
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
@@ -141,8 +148,17 @@ impl SkillMesh {
             authenticator,
             local_runner,
             circuit: Mutex::new(HashMap::new()),
+            tools_list_cache_ttl_secs: TOOLS_LIST_CACHE_TTL_SECS,
             refresh_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Override the `tools/list` lazy-cache TTL. The stdio `start` command sets
+    /// this from `--refresh-interval-secs` / `OXIDIZED_MCP_REFRESH_INTERVAL_SECS`.
+    /// Pass `u64::MAX` to disable time-based lazy refresh (startup refresh only).
+    pub fn with_tools_list_cache_ttl_secs(mut self, secs: u64) -> Self {
+        self.tools_list_cache_ttl_secs = secs;
+        self
     }
 
     pub fn azure(&self) -> Arc<AzureAuthBroker> {
@@ -157,14 +173,19 @@ impl SkillMesh {
         &self.local_runner
     }
 
-    /// Re-fetch the registry, re-discover tools, and atomically swap in the
-    /// new snapshot. `&self` so the call is safe to make from a background
-    /// refresh task while readers are calling `list_tools`/`call_tool`.
-    pub async fn refresh(&self) -> Result<(), MeshError> {
+    async fn refresh_inner(&self) -> Result<(), MeshError> {
         let manifest = self.loader.load(&self.registry_source).await?;
         let new_snapshot = self.build_snapshot(manifest).await;
         self.snapshot.store(Arc::new(new_snapshot));
         Ok(())
+    }
+
+    /// Re-fetch the registry, re-discover tools, and atomically swap in the
+    /// new snapshot. Serialized via [`Self::refresh_lock`] so background,
+    /// explicit, and lazy `tools/list` refreshes don't overlap.
+    pub async fn refresh(&self) -> Result<(), MeshError> {
+        let _guard = self.refresh_lock.lock().await;
+        self.refresh_inner().await
     }
 
     pub fn manifest(&self) -> Option<SkillManifest> {
@@ -179,33 +200,38 @@ impl SkillMesh {
         self.snapshot.load().aggregated_tools.clone()
     }
 
-    fn snapshot_is_stale(refreshed_at: Option<Instant>) -> bool {
+    fn snapshot_is_stale(&self, refreshed_at: Option<Instant>) -> bool {
         match refreshed_at {
-            Some(t) => t.elapsed() > Duration::from_secs(TOOLS_LIST_CACHE_TTL_SECS),
+            Some(t) => t.elapsed() > Duration::from_secs(self.tools_list_cache_ttl_secs),
             None => true,
         }
     }
 
     /// Return the aggregated tool list, refreshing from the registry when the
-    /// in-memory snapshot is older than [`TOOLS_LIST_CACHE_TTL_SECS`]. On
+    /// in-memory snapshot is older than [`Self::tools_list_cache_ttl_secs`]. On
     /// refresh failure the last good snapshot is returned so IDE `tools/list`
     /// stays responsive during transient registry outages.
     pub async fn list_tools_cached(&self) -> Vec<ToolDescriptor> {
         let snapshot = self.snapshot.load();
-        if !Self::snapshot_is_stale(snapshot.refreshed_at) {
+        if !self.snapshot_is_stale(snapshot.refreshed_at) {
             return snapshot.aggregated_tools.clone();
         }
 
         if let Ok(_guard) = self.refresh_lock.try_lock() {
             let snapshot = self.snapshot.load();
-            if Self::snapshot_is_stale(snapshot.refreshed_at) {
-                if let Err(e) = self.refresh().await {
+            if self.snapshot_is_stale(snapshot.refreshed_at) {
+                if let Err(e) = self.refresh_inner().await {
                     warn!(
                         error = %e,
                         "tools/list cache expired but refresh failed; returning stale snapshot"
                     );
                 }
             }
+        } else {
+            debug!(
+                ttl_secs = self.tools_list_cache_ttl_secs,
+                "tools/list cache expired but refresh already in progress; returning current snapshot"
+            );
         }
 
         self.snapshot.load().aggregated_tools.clone()

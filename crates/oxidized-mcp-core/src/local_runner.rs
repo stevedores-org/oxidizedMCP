@@ -153,8 +153,19 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("fake-podman");
-        std::fs::write(&path, script).unwrap();
+        
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(script.as_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        
+        // Prevent ExecutableFileBusy (ETXTBSY) on Linux CI
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        
         path
     }
 

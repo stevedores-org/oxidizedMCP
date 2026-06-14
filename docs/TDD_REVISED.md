@@ -42,7 +42,7 @@ If AKS hub times out:
 
 | Capability | MVP (`main` + `develop`) | Revised TDD | Gap |
 |------------|--------------------------|-------------|-----|
-| stdio MCP server | `crates/oxidized-mcp/src/stdio.rs` | Epic 1 | **Partial** — no SSE streaming |
+| stdio MCP server | `crates/oxidized-mcp/src/stdio.rs` | Epic 1 | **Done** — SSE streaming + client cancellation implemented (PR #30) |
 | stdio → HTTP routing | `oxidized-mcp-core` router | Epic 1 | **Done** for sync HTTP |
 | `tools/list` aggregation | `SkillMesh` + namespacing | Epic 3 | **Done** locally |
 | Registry URL fetch | `registry.rs` + `--refresh-interval-secs` (default 60) | Epic 3 | **Done** — file/URL sources with periodic refresh |

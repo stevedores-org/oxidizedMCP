@@ -201,7 +201,7 @@ Implementation: `crates/oxidized-mcp-core/src/local_runner.rs` +
 
 | Epic | Issue | Status |
 |------|-------|--------|
-| Protocol Translator (SSE)         | [#4](https://github.com/stevedores-org/oxidizedMCP/issues/4) | Not started (sync HTTP routing done; no SSE plumbing yet) |
+| Protocol Translator (SSE)         | [#4](https://github.com/stevedores-org/oxidizedMCP/issues/4) | **Rust done** (PR #30) — SSE streaming + client cancellation implemented |
 | Zero-Trust Auth (`azure_identity`) | [#5](https://github.com/stevedores-org/oxidizedMCP/issues/5) | **Rust done** — ingress JWT validation remains infra |
 | Dynamic Registry + 60s cache       | [#6](https://github.com/stevedores-org/oxidizedMCP/issues/6) | Done (`--refresh-interval-secs`, default 60; needs K8s ConfigMap source next) |
 | Health probes + dockworker.toml    | (n/a)                                                         | Done (PR #11) |

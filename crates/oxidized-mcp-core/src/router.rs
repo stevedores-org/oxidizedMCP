@@ -688,6 +688,7 @@ pub fn namespaced_tool(skill: &str, tool: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::mcp_types::{JsonRpcResponse, ToolsListResult};

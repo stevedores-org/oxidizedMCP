@@ -137,6 +137,7 @@ impl PodmanRunner {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::test_helpers::{fake_executable, test_env};

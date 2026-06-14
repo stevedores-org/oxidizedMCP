@@ -108,6 +108,8 @@ skills:
     description: GitHub API operations
     endpoint: https://skills.staging.example.com/github/mcp
     enabled: true
+    # Optional — local Podman fallback when the hub endpoint is unreachable:
+    # image: ghcr.io/example/github-skill:latest
 ```
 
 ## Environment variables
@@ -149,6 +151,36 @@ When `OXIDIZED_MCP_ENV=staging|production` or `OXIDIZED_MCP_USE_AZURE_AD=true`, 
 - **Token refresh**: SDK-managed cache + proactive 5-minute background refresh loop
 - **On failure**: MCP errors include `Run az login to refresh your Azure CLI session`
 
+### Local Podman fallback (Epic 4 / Issue #7)
+
+When an AKS hub skill endpoint times out or returns a transport error,
+`oxidizedMCP` can fall back to a cached OCI image on your laptop:
+
+1. Declare an optional `image` ref on the skill entry in the registry manifest.
+2. On HTTP failure, the router runs `podman image exists <image>`.
+3. If the image is present locally, it invokes `podman run -i --rm <image>` and
+   exchanges one JSON-RPC request/response line over stdio (same transport as
+   the proxy itself).
+4. After **3 consecutive HTTP failures** on that skill, a per-skill circuit
+   breaker opens and subsequent calls skip HTTP entirely — avoiding repeated
+   60s timeouts during an outage. A successful HTTP call or a Healthy refresh
+   probe resets the breaker.
+
+```yaml
+skills:
+  - name: infra-code
+    description: Crossplane / Flux / ESO GitOps skill
+    endpoint: https://skills.staging.example.com/infra-code/mcp
+    image: ghcr.io/lornu-ai/infra-code-skill:latest
+    enabled: true
+```
+
+Pre-pull images while online: `podman pull ghcr.io/lornu-ai/infra-code-skill:latest`.
+Skills without `image` keep the previous HTTP-only behavior.
+
+Implementation: `crates/oxidized-mcp-core/src/local_runner.rs` +
+`SkillMesh::call_tool` in `router.rs`. See `registry/skills.example.yaml`.
+
 ## Roadmap
 
 **MVP (shipped)**: stdio proxy, HTTP routing, registry aggregation — see [Issue #1](https://github.com/stevedores-org/oxidizedMCP/issues/1).
@@ -163,7 +195,7 @@ When `OXIDIZED_MCP_ENV=staging|production` or `OXIDIZED_MCP_USE_AZURE_AD=true`, 
 - [ ] **Epic 2** — Workload Identity Federation for cluster-side `oxidized-mcp` (not just developer laptops)
 - [ ] **Epic 2** — OCI skill packaging via dockworker.ai
 - [ ] **Epic 3** — Flux/Crossplane skill registry in the GKE hub
-- [ ] **Epic 4** — Podman fallback for offline mode
+- [x] **Epic 4** — Podman fallback for offline mode
 
 **Revised blueprint** ([Issue #3](https://github.com/stevedores-org/oxidizedMCP/issues/3), [docs/TDD_REVISED.md](./docs/TDD_REVISED.md)):
 

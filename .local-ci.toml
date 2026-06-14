@@ -60,12 +60,20 @@ enabled = true
 watch = ["**/*.rs"]
 
 [stages.docs]
-command = ["cargo", "doc", "--workspace", "--no-deps", "--all-features"]
+# local-ci's StageConfig has no `env` field (verified against
+# stevedores-org/local-ci config.go), so a top-level `env = { ... }` is
+# silently dropped. Set RUSTDOCFLAGS via `sh -c` so the strict
+# broken-intra-doc-links lint actually gates the local stage (matches what
+# `.github/workflows/ci.yml` runs in CI).
+command = [
+  "sh",
+  "-c",
+  "RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links' cargo doc --workspace --no-deps --all-features",
+]
 description = "Doc build (fails on broken intra-doc links)"
 timeout = 600
 enabled = true
 watch = ["**/*.rs"]
-env = { RUSTDOCFLAGS = "-D rustdoc::broken-intra-doc-links" }
 
 # ── Workflows ────────────────────────────────────────────────────────────────
 

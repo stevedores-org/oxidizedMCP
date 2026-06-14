@@ -12,6 +12,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # renovate: depName=rhysd/actionlint
+  ACTIONLINT_VERSION: '1.7.12'
 
 jobs:
   fmt:
@@ -82,8 +84,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install actionlint
+        # Install the pinned binary directly from the GitHub release tarball
+        # instead of `bash <(curl ... raw.githubusercontent.com/.../main/...)`,
+        # which was an unpinned remote-bash-exec — the script content on
+        # `main` could change without a corresponding workflow update.
         run: |
           set -euo pipefail
-          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          sudo mv actionlint /usr/local/bin/
+          tmp="$(mktemp -d)"
+          curl -fsSL \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C "$tmp" actionlint
+          sudo install -m 0755 "$tmp/actionlint" /usr/local/bin/actionlint
+          rm -rf "$tmp"
+          actionlint --version
       - run: actionlint -ignore SC2086 -ignore SC1091

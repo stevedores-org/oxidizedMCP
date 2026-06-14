@@ -139,45 +139,19 @@ impl PodmanRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{fake_executable, test_env};
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
-
-    fn fake_podman(script: &str, tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "oxidized-mcp-podman-{tag}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("fake-podman");
-
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&path).unwrap();
-            file.write_all(script.as_bytes()).unwrap();
-            file.sync_all().unwrap();
-        }
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // Prevent ExecutableFileBusy (ETXTBSY) on Linux CI
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        path
-    }
 
     #[tokio::test]
     async fn image_exists_returns_true_when_fake_binary_exits_zero() {
+        let _guard = test_env::lock();
         let script = r#"#!/bin/sh
 case "$1 $2" in
   "image exists") exit 0 ;;
   *) exit 99 ;;
 esac
 "#;
-        let bin = fake_podman(script, "exists-true");
+        let bin = fake_executable::write(script, "exists-true");
         let runner = PodmanRunner::with_binary(bin.to_string_lossy().into_owned());
         assert!(runner
             .image_exists("ghcr.io/example/skill:latest")
@@ -187,10 +161,11 @@ esac
 
     #[tokio::test]
     async fn image_exists_returns_false_when_fake_binary_exits_nonzero() {
+        let _guard = test_env::lock();
         let script = r#"#!/bin/sh
 exit 1
 "#;
-        let bin = fake_podman(script, "exists-false");
+        let bin = fake_executable::write(script, "exists-false");
         let runner = PodmanRunner::with_binary(bin.to_string_lossy().into_owned());
         assert!(!runner.image_exists("missing:tag").await.unwrap());
     }
@@ -207,6 +182,7 @@ exit 1
 
     #[tokio::test]
     async fn invoke_stdio_round_trips_one_line() {
+        let _guard = test_env::lock();
         // Fake "podman run" that echoes a canned JSON-RPC response. We don't
         // care that it ignores stdin — a real skill image would parse it; we
         // only need to verify the parent reads one line and parses it back.
@@ -215,7 +191,7 @@ exit 1
 cat > /dev/null
 echo '{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"}]}}'
 "#;
-        let bin = fake_podman(script, "invoke-ok");
+        let bin = fake_executable::write(script, "invoke-ok");
         let runner = PodmanRunner::with_binary(bin.to_string_lossy().into_owned());
 
         let req = JsonRpcRequest {
@@ -233,11 +209,12 @@ echo '{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"
 
     #[tokio::test]
     async fn invoke_stdio_errors_when_container_emits_invalid_json() {
+        let _guard = test_env::lock();
         let script = r#"#!/bin/sh
 cat > /dev/null
 echo 'not a json line'
 "#;
-        let bin = fake_podman(script, "invoke-bad");
+        let bin = fake_executable::write(script, "invoke-bad");
         let runner = PodmanRunner::with_binary(bin.to_string_lossy().into_owned());
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),

@@ -75,6 +75,7 @@ struct MeshSnapshot {
     manifest: Option<SkillManifest>,
     aggregated_tools: Vec<ToolDescriptor>,
     health: BTreeMap<String, SkillHealth>,
+    timestamp: Option<std::time::Instant>,
 }
 
 pub struct SkillMesh {
@@ -90,6 +91,7 @@ pub struct SkillMesh {
     /// rebuilt only on refresh. A `Mutex<HashMap>` is fine at our scales
     /// (tens of skills, single-digit calls per second per process).
     circuit: Mutex<HashMap<String, u32>>,
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl SkillMesh {
@@ -127,6 +129,7 @@ impl SkillMesh {
             authenticator,
             local_runner,
             circuit: Mutex::new(HashMap::new()),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -162,6 +165,35 @@ impl SkillMesh {
     /// against the next swap.
     pub fn list_tools(&self) -> Vec<ToolDescriptor> {
         self.snapshot.load().aggregated_tools.clone()
+    }
+
+    /// Retrieve the aggregated tool list, refreshing from the registry if
+    /// the cached snapshot is older than 60 seconds.
+    pub async fn list_tools_cached(&self) -> Vec<ToolDescriptor> {
+        let snapshot = self.snapshot.load();
+        let needs_refresh = match snapshot.timestamp {
+            Some(t) => t.elapsed() > std::time::Duration::from_secs(60),
+            None => true,
+        };
+
+        if needs_refresh {
+            if let Ok(_guard) = self.refresh_lock.try_lock() {
+                // Double check under lock to avoid concurrent updates
+                let snapshot = self.snapshot.load();
+                let still_needs_refresh = match snapshot.timestamp {
+                    Some(t) => t.elapsed() > std::time::Duration::from_secs(60),
+                    None => true,
+                };
+                if still_needs_refresh {
+                    if let Err(e) = self.refresh().await {
+                        warn!(error = %e, "Failed to refresh expired tools/list cache; returning stale data");
+                    }
+                }
+            }
+            self.snapshot.load().aggregated_tools.clone()
+        } else {
+            snapshot.aggregated_tools.clone()
+        }
     }
 
     /// Per-skill health from the most recent refresh, keyed by skill name.
@@ -411,6 +443,7 @@ impl SkillMesh {
             manifest: Some(manifest),
             aggregated_tools: aggregated,
             health,
+            timestamp: Some(std::time::Instant::now()),
         }
     }
 
@@ -1264,5 +1297,47 @@ skills:
             MeshError::LocalRun(_, _) => panic!("must not attempt local fallback without image"),
             other => panic!("expected HTTP-class error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn list_tools_cached_uses_cache_and_refreshes_after_expiry() {
+        let (endpoint, counter, _handle) = mock_skill_server_with_versions(100).await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: test-skill
+    description: Test
+    endpoint: {endpoint}
+"#
+        );
+        let path = write_registry(&yaml, "cached-list");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+
+        // After initial refresh, server must have been called exactly once
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // list_tools_cached when cache is fresh should NOT request the server again
+        let tools = mesh.list_tools_cached().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Manually expire the cache snapshot
+        let old_snapshot = mesh.snapshot.load();
+        let expired_snapshot = MeshSnapshot {
+            manifest: old_snapshot.manifest.clone(),
+            aggregated_tools: old_snapshot.aggregated_tools.clone(),
+            health: old_snapshot.health.clone(),
+            timestamp: Some(std::time::Instant::now() - std::time::Duration::from_secs(61)),
+        };
+        mesh.snapshot.store(Arc::new(expired_snapshot));
+
+        // Now calling list_tools_cached should trigger a refresh and call the server again
+        let tools2 = mesh.list_tools_cached().await;
+        assert_eq!(tools2.len(), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 }

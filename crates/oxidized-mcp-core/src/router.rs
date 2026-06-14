@@ -622,6 +622,7 @@ mod tests {
     use super::*;
     use crate::mcp_types::{JsonRpcResponse, ToolsListResult};
     use crate::proxy::StreamEvent;
+    use crate::test_helpers::{fake_executable, test_env};
     use axum::{response::IntoResponse, routing::post, Json, Router};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1141,16 +1142,7 @@ skills:
     }
 
     fn fake_podman(script: &str, tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "oxidized-mcp-router-podman-{tag}-{}",
-            uuid_simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("fake-podman");
-        std::fs::write(&path, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        fake_executable::write(script, tag)
     }
 
     /// Fake podman that returns success for `image exists` and emits a
@@ -1185,6 +1177,7 @@ esac
     /// One HTTP failure also bumps the breaker counter to 1.
     #[tokio::test]
     async fn http_failure_falls_back_to_podman_when_image_present() {
+        let _guard = test_env::lock();
         let (endpoint, _http_count, _handle) = mock_always_failing_with_counter().await;
         let podman_counter = std::env::temp_dir().join(format!("podman-count-{}", uuid_simple()));
         let podman_bin = fake_podman_always_works(&podman_counter);
@@ -1231,6 +1224,7 @@ skills:
     /// and not just inferred.
     #[tokio::test]
     async fn circuit_opens_after_threshold_and_skips_http() {
+        let _guard = test_env::lock();
         let (endpoint, http_count, _handle) = mock_always_failing_with_counter().await;
         let podman_counter = std::env::temp_dir().join(format!("podman-count-{}", uuid_simple()));
         let podman_bin = fake_podman_always_works(&podman_counter);
@@ -1284,6 +1278,7 @@ skills:
     /// so a recovered endpoint goes back to the HTTP path on the next call.
     #[tokio::test]
     async fn breaker_resets_on_healthy_refresh() {
+        let _guard = test_env::lock();
         let (endpoint, down, _handle) = mock_toggleable_skill_server().await;
         let podman_counter = std::env::temp_dir().join(format!("podman-count-{}", uuid_simple()));
         let podman_bin = fake_podman_always_works(&podman_counter);

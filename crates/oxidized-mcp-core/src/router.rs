@@ -3,6 +3,7 @@
 use crate::auth::{AuthMode, Authenticator, AzureAuthBroker, AzureAuthError};
 use crate::local_runner::{LocalRunError, PodmanRunner};
 use crate::mcp_types::{JsonRpcRequest, JsonRpcResponse, ToolCallResult, ToolDescriptor};
+use crate::proxy::{self, SseStream};
 use crate::registry::{RegistryLoader, RegistrySource, SkillEntry, SkillManifest};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,8 @@ pub enum MeshError {
     SkillUnreachable { skill: String, last_error: String },
     #[error("local Podman fallback for skill '{0}' failed: {1}")]
     LocalRun(String, #[source] LocalRunError),
+    #[error("skill '{0}' is not declared streaming in the manifest")]
+    StreamingNotEnabled(String),
 }
 
 /// Health status of a single skill as observed at the last `refresh`.
@@ -484,35 +487,97 @@ impl SkillMesh {
         endpoint: &str,
         request: &JsonRpcRequest,
     ) -> Result<JsonRpcResponse, MeshError> {
-        let mut req = self.client.post(endpoint).json(request);
+        let auth_header = self.resolve_auth_header(skill_name, endpoint).await?;
+        proxy::post_json_rpc(&self.client, endpoint, skill_name, auth_header, request).await
+    }
 
-        // Attach Bearer when the mesh is configured for authenticated outbound
-        // calls. Auth failures are NOT silently swallowed — a misconfigured
-        // gcloud session should surface as a clear MeshError, not as an
-        // anonymous request that the cluster Gateway rejects with 401/403.
+    /// Resolve the outbound `Authorization` header value for a request against
+    /// `endpoint`. Returns `None` when the mesh is configured anonymous AND the
+    /// endpoint is outside the Azure-auth match set. Auth failures are NOT
+    /// silently swallowed — a misconfigured gcloud session must surface as a
+    /// clear `MeshError`, not as an anonymous request the cluster Gateway
+    /// would then reject with 401/403.
+    async fn resolve_auth_header(
+        &self,
+        skill_name: &str,
+        endpoint: &str,
+    ) -> Result<Option<String>, MeshError> {
         if let Some(token) = self
             .authenticator
             .bearer_token()
             .await
             .map_err(|e| MeshError::Auth(skill_name.to_string(), e))?
         {
-            req = req.bearer_auth(token);
-        } else if self.azure.should_authenticate(endpoint) {
+            return Ok(Some(format!("Bearer {token}")));
+        }
+        if self.azure.should_authenticate(endpoint) {
             let header = self
                 .azure
                 .authorization_header()
                 .await
                 .map_err(|e| MeshError::AzureAuth(azure_auth_message(e)))?;
-            req = req.header("Authorization", header);
+            return Ok(Some(header));
+        }
+        Ok(None)
+    }
+
+    /// Open an SSE stream against a streaming-capable skill's `tools/call`
+    /// endpoint. Only skills with `streaming: true` in the manifest accept
+    /// this path — calling it on a single-shot skill surfaces
+    /// `MeshError::StreamingNotEnabled` so the caller can fall back to
+    /// `call_tool` rather than receive an opaque protocol error from the
+    /// upstream HTTP server.
+    ///
+    /// The returned [`SseStream`] yields each decoded SSE event in order
+    /// (notifications first, a final response last) and exposes `cancel()` so
+    /// the IDE's `$/cancelRequest` can close the upstream connection without
+    /// waiting for the skill to finish on its own.
+    pub async fn open_streaming_call(
+        &self,
+        namespaced_name: &str,
+        arguments: Value,
+    ) -> Result<SseStream, MeshError> {
+        let (skill_name, tool_name) = parse_namespaced_tool(namespaced_name)?;
+        let skill_entry = self.resolve_skill_entry(&skill_name)?;
+        if !skill_entry.streaming {
+            return Err(MeshError::StreamingNotEnabled(skill_name));
         }
 
-        req.send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| MeshError::Http(skill_name.to_string(), e))?
-            .json()
-            .await
-            .map_err(|e| MeshError::Http(skill_name.to_string(), e))
+        let request = JsonRpcRequest {
+            jsonrpc: crate::mcp_types::JSONRPC_VERSION.to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": tool_name,
+                "arguments": arguments
+            })),
+        };
+
+        let auth_header = self
+            .resolve_auth_header(&skill_name, &skill_entry.endpoint)
+            .await?;
+        proxy::open_streaming_call(
+            &self.client,
+            &skill_entry.endpoint,
+            &skill_name,
+            auth_header,
+            &request,
+        )
+        .await
+    }
+
+    /// Indicates whether the skill behind `namespaced_name` is declared
+    /// streaming in the active snapshot. The stdio dispatcher reads this to
+    /// decide between `call_tool` and `open_streaming_call`; returns `false`
+    /// when the skill is unknown so the caller falls through to its usual
+    /// not-found path.
+    pub fn is_skill_streaming(&self, namespaced_name: &str) -> bool {
+        let Ok((skill_name, _)) = parse_namespaced_tool(namespaced_name) else {
+            return false;
+        };
+        self.resolve_skill_entry(&skill_name)
+            .map(|entry| entry.streaming)
+            .unwrap_or(false)
     }
 }
 
@@ -554,6 +619,7 @@ pub fn namespaced_tool(skill: &str, tool: &str) -> String {
 mod tests {
     use super::*;
     use crate::mcp_types::{JsonRpcResponse, ToolsListResult};
+    use crate::proxy::StreamEvent;
     use axum::{response::IntoResponse, routing::post, Json, Router};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1289,5 +1355,273 @@ skills:
             MeshError::LocalRun(_, _) => panic!("must not attempt local fallback without image"),
             other => panic!("expected HTTP-class error, got {other:?}"),
         }
+    }
+
+    // ---- SSE streaming tools/call (issue #24) ----
+
+    /// Mock skill server that handles `tools/list` synchronously and answers
+    /// `tools/call` with an SSE stream. The body the caller passes in becomes
+    /// the upstream behavior: a vec of `SseFrame`s emitted in order, with an
+    /// optional cancel-aware "tail" that keeps emitting until the upstream
+    /// connection drops. This lets one helper drive both the happy-path
+    /// streaming test and the cancellation test.
+    enum SseFrame {
+        Notification(Value),
+        Final(Value),
+    }
+
+    async fn mock_streaming_skill_server(
+        events: Vec<SseFrame>,
+        tail_after_events: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::response::sse::{Event, Sse};
+        use axum::response::IntoResponse;
+        use std::convert::Infallible;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let events = Arc::new(events);
+        let app = Router::new().route(
+            "/mcp",
+            post(move |Json(req): Json<JsonRpcRequest>| {
+                let events = events.clone();
+                async move {
+                    match req.method.as_str() {
+                        "tools/list" => Json(JsonRpcResponse::ok(
+                            req.id,
+                            serde_json::to_value(ToolsListResult {
+                                tools: vec![ToolDescriptor {
+                                    name: "long".to_string(),
+                                    description: "Long-running streaming tool".to_string(),
+                                    input_schema: json!({}),
+                                }],
+                            })
+                            .unwrap(),
+                        ))
+                        .into_response(),
+                        "tools/call" => {
+                            let (tx, rx) =
+                                tokio::sync::mpsc::channel::<Result<Event, Infallible>>(8);
+                            let events_clone = events.clone();
+                            tokio::spawn(async move {
+                                for frame in events_clone.iter() {
+                                    let payload = match frame {
+                                        SseFrame::Notification(v) | SseFrame::Final(v) => v,
+                                    };
+                                    if tx
+                                        .send(Ok(Event::default().data(payload.to_string())))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                }
+                                if tail_after_events {
+                                    // Keep emitting heartbeats until the
+                                    // receiver (= upstream connection) is
+                                    // dropped. Used to exercise the
+                                    // cancellation path: the test cancels
+                                    // mid-stream, which closes the connection
+                                    // and makes `tx.send` fail.
+                                    let mut i = 0u64;
+                                    loop {
+                                        let payload = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "notifications/progress",
+                                            "params": { "tick": i }
+                                        });
+                                        if tx
+                                            .send(Ok(Event::default().data(payload.to_string())))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                        i += 1;
+                                        tokio::time::sleep(std::time::Duration::from_millis(25))
+                                            .await;
+                                    }
+                                }
+                            });
+                            Sse::new(ReceiverStream::new(rx)).into_response()
+                        }
+                        _ => Json(JsonRpcResponse::err(req.id, -32601, "unknown method"))
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/mcp"), handle)
+    }
+
+    /// Issue #24 AC #5: a mock SSE skill server emits N data events + a
+    /// final event; the proxy delivers N notifications + 1 response. Three
+    /// notifications followed by a final result are sufficient to prove the
+    /// ordering and the response-id rewrite below.
+    #[tokio::test]
+    async fn streaming_tool_call_emits_n_notifications_then_final() {
+        let notifs = (1..=3)
+            .map(|step| {
+                SseFrame::Notification(json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": { "step": step }
+                }))
+            })
+            .collect::<Vec<_>>();
+        let mut events = notifs;
+        events.push(SseFrame::Final(json!({
+            "jsonrpc": "2.0",
+            "id": 999,
+            "result": { "content": [{ "type": "text", "text": "done" }] }
+        })));
+
+        let (endpoint, _handle) = mock_streaming_skill_server(events, false).await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: long
+    description: Streaming skill
+    endpoint: {endpoint}
+    streaming: true
+"#
+        );
+        let path = write_registry(&yaml, "sse-happy");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+        // The skill discovered as streaming-capable.
+        assert!(mesh.is_skill_streaming("long::long"));
+
+        let mut stream = mesh
+            .open_streaming_call("long::long", json!({}))
+            .await
+            .expect("streaming call should open against a streaming skill");
+
+        let mut notification_count = 0usize;
+        let mut saw_final = false;
+        while let Some(event) = stream.recv().await {
+            match event.expect("no error events expected") {
+                StreamEvent::Notification(notif) => {
+                    assert!(notif.id.is_none(), "notifications must not carry an id");
+                    assert_eq!(notif.method, "notifications/progress");
+                    notification_count += 1;
+                }
+                StreamEvent::Final(resp) => {
+                    assert!(resp.result.is_some());
+                    // The skill emitted id=999; the proxy passes that through
+                    // here — stdio is what rewrites it to the IDE's id, and
+                    // we cover that contract in the integration test above.
+                    assert_eq!(resp.id, Some(json!(999)));
+                    saw_final = true;
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            notification_count, 3,
+            "must see exactly the three notifications emitted by the mock"
+        );
+        assert!(saw_final, "must reach the Final event");
+    }
+
+    /// Issue #24 AC #1: calling `open_streaming_call` on a skill that does NOT
+    /// declare `streaming: true` surfaces a typed error instead of opening
+    /// the stream — callers can fall back to `call_tool` on that signal.
+    #[tokio::test]
+    async fn open_streaming_call_errors_when_skill_not_streaming() {
+        let (endpoint, _handle) = mock_skill_server().await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: regular
+    description: Non-streaming skill
+    endpoint: {endpoint}
+"#
+        );
+        let path = write_registry(&yaml, "sse-not-enabled");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+        assert!(!mesh.is_skill_streaming("regular::echo"));
+
+        let err = mesh
+            .open_streaming_call("regular::echo", json!({}))
+            .await
+            .expect_err("non-streaming skill must reject open_streaming_call");
+        match err {
+            MeshError::StreamingNotEnabled(name) => assert_eq!(name, "regular"),
+            other => panic!("expected StreamingNotEnabled, got {other:?}"),
+        }
+    }
+
+    /// Issue #24 AC #4: cancelling an in-flight stream closes the upstream
+    /// connection and `recv()` returns `None` promptly. We assert the
+    /// receiver closes within a generous timeout — the cancellation path is
+    /// supposed to make this immediate, not "eventually after the next
+    /// heartbeat in 30s".
+    #[tokio::test]
+    async fn cancel_closes_stream_promptly() {
+        // No "final" frame — the mock will spin notifications until the
+        // upstream connection drops. Cancellation must make that happen.
+        let (endpoint, _handle) = mock_streaming_skill_server(Vec::new(), true).await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: forever
+    description: Never finishes
+    endpoint: {endpoint}
+    streaming: true
+"#
+        );
+        let path = write_registry(&yaml, "sse-cancel");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+
+        let mut stream = mesh
+            .open_streaming_call("forever::long", json!({}))
+            .await
+            .expect("streaming call should open");
+
+        // Pull one notification to confirm the stream is live, then cancel.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv())
+            .await
+            .expect("must observe a heartbeat notification within 2s")
+            .expect("channel must yield");
+        assert!(matches!(first, Ok(StreamEvent::Notification(_))));
+
+        stream.cancel();
+
+        // After cancel, the channel must close (recv → None) within a
+        // generous bound so a sleeping pump doesn't keep us stalled.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match stream.recv().await {
+                    // The pump may already have a buffered event in the
+                    // channel from before the cancel fired; drain those
+                    // and keep looking for the close signal.
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => return (),
+                }
+            }
+        })
+        .await;
+        assert!(
+            next.is_ok(),
+            "stream channel must close within 2s of cancel()"
+        );
     }
 }

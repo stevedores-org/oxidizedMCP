@@ -9,10 +9,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 pub const TOOL_NAMESPACE_SEP: &str = "::";
+
+/// Maximum age of the aggregated `tools/list` snapshot before
+/// [`SkillMesh::list_tools_cached`] triggers a refresh. Matches the default
+/// `--refresh-interval-secs` / `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` value.
+pub const TOOLS_LIST_CACHE_TTL_SECS: u64 = 60;
 
 /// Number of consecutive HTTP failures (per skill) before the router stops
 /// burning the per-call timeout on the cloud endpoint and routes straight to
@@ -79,6 +85,7 @@ struct MeshSnapshot {
     manifest: Option<SkillManifest>,
     aggregated_tools: Vec<ToolDescriptor>,
     health: BTreeMap<String, SkillHealth>,
+    refreshed_at: Option<Instant>,
 }
 
 pub struct SkillMesh {
@@ -94,6 +101,9 @@ pub struct SkillMesh {
     /// rebuilt only on refresh. A `Mutex<HashMap>` is fine at our scales
     /// (tens of skills, single-digit calls per second per process).
     circuit: Mutex<HashMap<String, u32>>,
+    /// Serializes on-demand refreshes triggered by [`Self::list_tools_cached`]
+    /// so concurrent IDE `tools/list` calls don't stampede skill backends.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl SkillMesh {
@@ -131,6 +141,7 @@ impl SkillMesh {
             authenticator,
             local_runner,
             circuit: Mutex::new(HashMap::new()),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -165,6 +176,38 @@ impl SkillMesh {
     /// of exposing the underlying Arc would force callers to manage lifetimes
     /// against the next swap.
     pub fn list_tools(&self) -> Vec<ToolDescriptor> {
+        self.snapshot.load().aggregated_tools.clone()
+    }
+
+    fn snapshot_is_stale(refreshed_at: Option<Instant>) -> bool {
+        match refreshed_at {
+            Some(t) => t.elapsed() > Duration::from_secs(TOOLS_LIST_CACHE_TTL_SECS),
+            None => true,
+        }
+    }
+
+    /// Return the aggregated tool list, refreshing from the registry when the
+    /// in-memory snapshot is older than [`TOOLS_LIST_CACHE_TTL_SECS`]. On
+    /// refresh failure the last good snapshot is returned so IDE `tools/list`
+    /// stays responsive during transient registry outages.
+    pub async fn list_tools_cached(&self) -> Vec<ToolDescriptor> {
+        let snapshot = self.snapshot.load();
+        if !Self::snapshot_is_stale(snapshot.refreshed_at) {
+            return snapshot.aggregated_tools.clone();
+        }
+
+        if let Ok(_guard) = self.refresh_lock.try_lock() {
+            let snapshot = self.snapshot.load();
+            if Self::snapshot_is_stale(snapshot.refreshed_at) {
+                if let Err(e) = self.refresh().await {
+                    warn!(
+                        error = %e,
+                        "tools/list cache expired but refresh failed; returning stale snapshot"
+                    );
+                }
+            }
+        }
+
         self.snapshot.load().aggregated_tools.clone()
     }
 
@@ -435,6 +478,7 @@ impl SkillMesh {
             manifest: Some(manifest),
             aggregated_tools: aggregated,
             health,
+            refreshed_at: Some(Instant::now()),
         }
     }
 
@@ -1289,5 +1333,50 @@ skills:
             MeshError::LocalRun(_, _) => panic!("must not attempt local fallback without image"),
             other => panic!("expected HTTP-class error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn list_tools_cached_uses_cache_and_refreshes_after_expiry() {
+        let (endpoint, counter, _handle) = mock_skill_server_with_versions(100).await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: test-skill
+    description: Test
+    endpoint: {endpoint}
+"#
+        );
+        let path = write_registry(&yaml, "cached-list");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let tools = mesh.list_tools_cached().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "fresh cache must not re-probe skills"
+        );
+
+        let old_snapshot = mesh.snapshot.load();
+        let expired_snapshot = MeshSnapshot {
+            manifest: old_snapshot.manifest.clone(),
+            aggregated_tools: old_snapshot.aggregated_tools.clone(),
+            health: old_snapshot.health.clone(),
+            refreshed_at: Some(Instant::now() - Duration::from_secs(TOOLS_LIST_CACHE_TTL_SECS + 1)),
+        };
+        mesh.snapshot.store(Arc::new(expired_snapshot));
+
+        let tools2 = mesh.list_tools_cached().await;
+        assert_eq!(tools2.len(), 1);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "expired cache must trigger a refresh"
+        );
     }
 }

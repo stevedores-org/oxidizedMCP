@@ -136,7 +136,12 @@ async fn main() -> Result<ExitCode> {
                 "starting oxidizedMCP stdio server"
             );
 
-            let mesh = Arc::new(SkillMesh::with_auth(source, Authenticator::new(auth_mode)));
+            let mesh = Arc::new(
+                SkillMesh::with_auth(source, Authenticator::new(auth_mode))
+                    .with_tools_list_cache_ttl_secs(tools_list_cache_ttl_secs(
+                        refresh_interval_secs,
+                    )),
+            );
             mesh.refresh()
                 .await
                 .context("initial registry refresh failed")?;
@@ -281,6 +286,17 @@ fn print_health_table(health: &std::collections::BTreeMap<String, oxidized_mcp_c
             last_error,
             name_width = name_width,
         );
+    }
+}
+
+/// Map `--refresh-interval-secs` to the lazy `tools/list` cache TTL. When
+/// periodic refresh is disabled (0), lazy refresh is also disabled so only
+/// the startup refresh populates the snapshot.
+fn tools_list_cache_ttl_secs(refresh_interval_secs: u64) -> u64 {
+    if refresh_interval_secs == 0 {
+        u64::MAX
+    } else {
+        refresh_interval_secs
     }
 }
 

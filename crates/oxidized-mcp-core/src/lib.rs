@@ -22,5 +22,5 @@ pub use proxy::{SseStream, StreamEvent};
 pub use registry::{RegistryError, RegistryLoader, RegistrySource, SkillEntry, SkillManifest};
 pub use router::{
     namespaced_tool, parse_namespaced_tool, MeshError, SkillHealth, SkillMesh, SkillStatus,
-    TOOL_NAMESPACE_SEP,
+    TOOLS_LIST_CACHE_TTL_SECS, TOOL_NAMESPACE_SEP,
 };

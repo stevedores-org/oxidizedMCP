@@ -227,7 +227,7 @@ async fn handle_request(mesh: &SkillMesh, request: JsonRpcRequest) -> Option<Jso
             }),
         )),
         "tools/list" => {
-            let tools = mesh.list_tools();
+            let tools = mesh.list_tools_cached().await;
             Some(JsonRpcResponse::ok(
                 id,
                 serde_json::to_value(ToolsListResult { tools })

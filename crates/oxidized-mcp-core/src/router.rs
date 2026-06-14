@@ -10,10 +10,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 pub const TOOL_NAMESPACE_SEP: &str = "::";
+
+/// Default maximum age of the aggregated `tools/list` snapshot before
+/// [`SkillMesh::list_tools_cached`] triggers a refresh. The `start` command
+/// wires this from `--refresh-interval-secs` / `OXIDIZED_MCP_REFRESH_INTERVAL_SECS`
+/// via [`SkillMesh::with_tools_list_cache_ttl_secs`]; this constant is the
+/// fallback for other entrypoints (`discover`, `list-tools`, tests).
+pub const TOOLS_LIST_CACHE_TTL_SECS: u64 = 60;
 
 /// Number of consecutive HTTP failures (per skill) before the router stops
 /// burning the per-call timeout on the cloud endpoint and routes straight to
@@ -82,6 +90,7 @@ struct MeshSnapshot {
     manifest: Option<SkillManifest>,
     aggregated_tools: Vec<ToolDescriptor>,
     health: BTreeMap<String, SkillHealth>,
+    refreshed_at: Option<Instant>,
 }
 
 pub struct SkillMesh {
@@ -97,6 +106,14 @@ pub struct SkillMesh {
     /// rebuilt only on refresh. A `Mutex<HashMap>` is fine at our scales
     /// (tens of skills, single-digit calls per second per process).
     circuit: Mutex<HashMap<String, u32>>,
+    /// Maximum age of the aggregated snapshot before [`Self::list_tools_cached`]
+    /// triggers a refresh. Set from `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` in the
+    /// stdio server; defaults to [`TOOLS_LIST_CACHE_TTL_SECS`].
+    tools_list_cache_ttl_secs: u64,
+    /// Serializes all registry refreshes (background loop, explicit
+    /// [`Self::refresh`], and on-demand [`Self::list_tools_cached`]) so
+    /// concurrent callers don't stampede skill backends.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl SkillMesh {
@@ -134,7 +151,17 @@ impl SkillMesh {
             authenticator,
             local_runner,
             circuit: Mutex::new(HashMap::new()),
+            tools_list_cache_ttl_secs: TOOLS_LIST_CACHE_TTL_SECS,
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Override the `tools/list` lazy-cache TTL. The stdio `start` command sets
+    /// this from `--refresh-interval-secs` / `OXIDIZED_MCP_REFRESH_INTERVAL_SECS`.
+    /// Pass `u64::MAX` to disable time-based lazy refresh (startup refresh only).
+    pub fn with_tools_list_cache_ttl_secs(mut self, secs: u64) -> Self {
+        self.tools_list_cache_ttl_secs = secs;
+        self
     }
 
     pub fn azure(&self) -> Arc<AzureAuthBroker> {
@@ -149,14 +176,19 @@ impl SkillMesh {
         &self.local_runner
     }
 
-    /// Re-fetch the registry, re-discover tools, and atomically swap in the
-    /// new snapshot. `&self` so the call is safe to make from a background
-    /// refresh task while readers are calling `list_tools`/`call_tool`.
-    pub async fn refresh(&self) -> Result<(), MeshError> {
+    async fn refresh_inner(&self) -> Result<(), MeshError> {
         let manifest = self.loader.load(&self.registry_source).await?;
         let new_snapshot = self.build_snapshot(manifest).await;
         self.snapshot.store(Arc::new(new_snapshot));
         Ok(())
+    }
+
+    /// Re-fetch the registry, re-discover tools, and atomically swap in the
+    /// new snapshot. Serialized via [`Self::refresh_lock`] so background,
+    /// explicit, and lazy `tools/list` refreshes don't overlap.
+    pub async fn refresh(&self) -> Result<(), MeshError> {
+        let _guard = self.refresh_lock.lock().await;
+        self.refresh_inner().await
     }
 
     pub fn manifest(&self) -> Option<SkillManifest> {
@@ -168,6 +200,43 @@ impl SkillMesh {
     /// of exposing the underlying Arc would force callers to manage lifetimes
     /// against the next swap.
     pub fn list_tools(&self) -> Vec<ToolDescriptor> {
+        self.snapshot.load().aggregated_tools.clone()
+    }
+
+    fn snapshot_is_stale(&self, refreshed_at: Option<Instant>) -> bool {
+        match refreshed_at {
+            Some(t) => t.elapsed() > Duration::from_secs(self.tools_list_cache_ttl_secs),
+            None => true,
+        }
+    }
+
+    /// Return the aggregated tool list, refreshing from the registry when the
+    /// in-memory snapshot is older than [`Self::tools_list_cache_ttl_secs`]. On
+    /// refresh failure the last good snapshot is returned so IDE `tools/list`
+    /// stays responsive during transient registry outages.
+    pub async fn list_tools_cached(&self) -> Vec<ToolDescriptor> {
+        let snapshot = self.snapshot.load();
+        if !self.snapshot_is_stale(snapshot.refreshed_at) {
+            return snapshot.aggregated_tools.clone();
+        }
+
+        if let Ok(_guard) = self.refresh_lock.try_lock() {
+            let snapshot = self.snapshot.load();
+            if self.snapshot_is_stale(snapshot.refreshed_at) {
+                if let Err(e) = self.refresh_inner().await {
+                    warn!(
+                        error = %e,
+                        "tools/list cache expired but refresh failed; returning stale snapshot"
+                    );
+                }
+            }
+        } else {
+            debug!(
+                ttl_secs = self.tools_list_cache_ttl_secs,
+                "tools/list cache expired but refresh already in progress; returning current snapshot"
+            );
+        }
+
         self.snapshot.load().aggregated_tools.clone()
     }
 
@@ -438,6 +507,7 @@ impl SkillMesh {
             manifest: Some(manifest),
             aggregated_tools: aggregated,
             health,
+            refreshed_at: Some(Instant::now()),
         }
     }
 
@@ -1354,6 +1424,51 @@ skills:
         }
     }
 
+    #[tokio::test]
+    async fn list_tools_cached_uses_cache_and_refreshes_after_expiry() {
+        let (endpoint, counter, _handle) = mock_skill_server_with_versions(100).await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: test-skill
+    description: Test
+    endpoint: {endpoint}
+"#
+        );
+        let path = write_registry(&yaml, "cached-list");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let tools = mesh.list_tools_cached().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "fresh cache must not re-probe skills"
+        );
+
+        let old_snapshot = mesh.snapshot.load();
+        let expired_snapshot = MeshSnapshot {
+            manifest: old_snapshot.manifest.clone(),
+            aggregated_tools: old_snapshot.aggregated_tools.clone(),
+            health: old_snapshot.health.clone(),
+            refreshed_at: Some(Instant::now() - Duration::from_secs(TOOLS_LIST_CACHE_TTL_SECS + 1)),
+        };
+        mesh.snapshot.store(Arc::new(expired_snapshot));
+
+        let tools2 = mesh.list_tools_cached().await;
+        assert_eq!(tools2.len(), 1);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "expired cache must trigger a refresh"
+        );
+    }
+
     // ---- SSE streaming tools/call (issue #24) ----
 
     /// Mock skill server that handles `tools/list` synchronously and answers
@@ -1611,7 +1726,7 @@ skills:
                     // channel from before the cancel fired; drain those
                     // and keep looking for the close signal.
                     Some(Ok(_)) => continue,
-                    Some(Err(_)) | None => return (),
+                    Some(Err(_)) | None => return,
                 }
             }
         })

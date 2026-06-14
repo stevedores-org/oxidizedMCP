@@ -91,9 +91,13 @@ jobs:
         run: |
           set -euo pipefail
           tmp="$(mktemp -d)"
+          # Unconstrained extract (matches the apko/kustomize install
+          # pattern used in lornu-ai/dockworker.ai). The single-file form
+          # `tar ... actionlint` would silently break if a future release
+          # ever nests the binary under e.g. actionlint_<ver>_linux_amd64/.
           curl -fsSL \
             "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
-            | tar -xz -C "$tmp" actionlint
+            | tar -xz -C "$tmp"
           sudo install -m 0755 "$tmp/actionlint" /usr/local/bin/actionlint
           rm -rf "$tmp"
           actionlint --version

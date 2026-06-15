@@ -3,16 +3,25 @@
 use crate::auth::{AuthMode, Authenticator, AzureAuthBroker, AzureAuthError};
 use crate::local_runner::{LocalRunError, PodmanRunner};
 use crate::mcp_types::{JsonRpcRequest, JsonRpcResponse, ToolCallResult, ToolDescriptor};
+use crate::proxy::{self, SseStream};
 use crate::registry::{RegistryLoader, RegistrySource, SkillEntry, SkillManifest};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 pub const TOOL_NAMESPACE_SEP: &str = "::";
+
+/// Default maximum age of the aggregated `tools/list` snapshot before
+/// [`SkillMesh::list_tools_cached`] triggers a refresh. The `start` command
+/// wires this from `--refresh-interval-secs` / `OXIDIZED_MCP_REFRESH_INTERVAL_SECS`
+/// via [`SkillMesh::with_tools_list_cache_ttl_secs`]; this constant is the
+/// fallback for other entrypoints (`discover`, `list-tools`, tests).
+pub const TOOLS_LIST_CACHE_TTL_SECS: u64 = 60;
 
 /// Number of consecutive HTTP failures (per skill) before the router stops
 /// burning the per-call timeout on the cloud endpoint and routes straight to
@@ -45,6 +54,8 @@ pub enum MeshError {
     SkillUnreachable { skill: String, last_error: String },
     #[error("local Podman fallback for skill '{0}' failed: {1}")]
     LocalRun(String, #[source] LocalRunError),
+    #[error("skill '{0}' is not declared streaming in the manifest")]
+    StreamingNotEnabled(String),
 }
 
 /// Health status of a single skill as observed at the last `refresh`.
@@ -79,7 +90,7 @@ struct MeshSnapshot {
     manifest: Option<SkillManifest>,
     aggregated_tools: Vec<ToolDescriptor>,
     health: BTreeMap<String, SkillHealth>,
-    timestamp: Option<std::time::Instant>,
+    refreshed_at: Option<Instant>,
 }
 
 pub struct SkillMesh {
@@ -95,6 +106,13 @@ pub struct SkillMesh {
     /// rebuilt only on refresh. A `Mutex<HashMap>` is fine at our scales
     /// (tens of skills, single-digit calls per second per process).
     circuit: Mutex<HashMap<String, u32>>,
+    /// Maximum age of the aggregated snapshot before [`Self::list_tools_cached`]
+    /// triggers a refresh. Set from `OXIDIZED_MCP_REFRESH_INTERVAL_SECS` in the
+    /// stdio server; defaults to [`TOOLS_LIST_CACHE_TTL_SECS`].
+    tools_list_cache_ttl_secs: u64,
+    /// Serializes all registry refreshes (background loop, explicit
+    /// [`Self::refresh`], and on-demand [`Self::list_tools_cached`]) so
+    /// concurrent callers don't stampede skill backends.
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
@@ -133,8 +151,17 @@ impl SkillMesh {
             authenticator,
             local_runner,
             circuit: Mutex::new(HashMap::new()),
+            tools_list_cache_ttl_secs: TOOLS_LIST_CACHE_TTL_SECS,
             refresh_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Override the `tools/list` lazy-cache TTL. The stdio `start` command sets
+    /// this from `--refresh-interval-secs` / `OXIDIZED_MCP_REFRESH_INTERVAL_SECS`.
+    /// Pass `u64::MAX` to disable time-based lazy refresh (startup refresh only).
+    pub fn with_tools_list_cache_ttl_secs(mut self, secs: u64) -> Self {
+        self.tools_list_cache_ttl_secs = secs;
+        self
     }
 
     pub fn azure(&self) -> Arc<AzureAuthBroker> {
@@ -149,14 +176,19 @@ impl SkillMesh {
         &self.local_runner
     }
 
-    /// Re-fetch the registry, re-discover tools, and atomically swap in the
-    /// new snapshot. `&self` so the call is safe to make from a background
-    /// refresh task while readers are calling `list_tools`/`call_tool`.
-    pub async fn refresh(&self) -> Result<(), MeshError> {
+    async fn refresh_inner(&self) -> Result<(), MeshError> {
         let manifest = self.loader.load(&self.registry_source).await?;
         let new_snapshot = self.build_snapshot(manifest).await;
         self.snapshot.store(Arc::new(new_snapshot));
         Ok(())
+    }
+
+    /// Re-fetch the registry, re-discover tools, and atomically swap in the
+    /// new snapshot. Serialized via [`Self::refresh_lock`] so background,
+    /// explicit, and lazy `tools/list` refreshes don't overlap.
+    pub async fn refresh(&self) -> Result<(), MeshError> {
+        let _guard = self.refresh_lock.lock().await;
+        self.refresh_inner().await
     }
 
     pub fn manifest(&self) -> Option<SkillManifest> {
@@ -171,33 +203,41 @@ impl SkillMesh {
         self.snapshot.load().aggregated_tools.clone()
     }
 
-    /// Retrieve the aggregated tool list, refreshing from the registry if
-    /// the cached snapshot is older than 60 seconds.
+    fn snapshot_is_stale(&self, refreshed_at: Option<Instant>) -> bool {
+        match refreshed_at {
+            Some(t) => t.elapsed() > Duration::from_secs(self.tools_list_cache_ttl_secs),
+            None => true,
+        }
+    }
+
+    /// Return the aggregated tool list, refreshing from the registry when the
+    /// in-memory snapshot is older than [`Self::tools_list_cache_ttl_secs`]. On
+    /// refresh failure the last good snapshot is returned so IDE `tools/list`
+    /// stays responsive during transient registry outages.
     pub async fn list_tools_cached(&self) -> Vec<ToolDescriptor> {
         let snapshot = self.snapshot.load();
-        let needs_refresh = match snapshot.timestamp {
-            Some(t) => t.elapsed() > std::time::Duration::from_secs(60),
-            None => true,
-        };
+        if !self.snapshot_is_stale(snapshot.refreshed_at) {
+            return snapshot.aggregated_tools.clone();
+        }
 
-        if needs_refresh {
-            if let Ok(_guard) = self.refresh_lock.try_lock() {
-                // Double check under lock to avoid concurrent updates
-                let snapshot = self.snapshot.load();
-                let still_needs_refresh = match snapshot.timestamp {
-                    Some(t) => t.elapsed() > std::time::Duration::from_secs(60),
-                    None => true,
-                };
-                if still_needs_refresh {
-                    if let Err(e) = self.refresh().await {
-                        warn!(error = %e, "Failed to refresh expired tools/list cache; returning stale data");
-                    }
+        if let Ok(_guard) = self.refresh_lock.try_lock() {
+            let snapshot = self.snapshot.load();
+            if self.snapshot_is_stale(snapshot.refreshed_at) {
+                if let Err(e) = self.refresh_inner().await {
+                    warn!(
+                        error = %e,
+                        "tools/list cache expired but refresh failed; returning stale snapshot"
+                    );
                 }
             }
-            self.snapshot.load().aggregated_tools.clone()
         } else {
-            snapshot.aggregated_tools.clone()
+            debug!(
+                ttl_secs = self.tools_list_cache_ttl_secs,
+                "tools/list cache expired but refresh already in progress; returning current snapshot"
+            );
         }
+
+        self.snapshot.load().aggregated_tools.clone()
     }
 
     /// Per-skill health from the most recent refresh, keyed by skill name.
@@ -467,7 +507,7 @@ impl SkillMesh {
             manifest: Some(manifest),
             aggregated_tools: aggregated,
             health,
-            timestamp: Some(std::time::Instant::now()),
+            refreshed_at: Some(Instant::now()),
         }
     }
 
@@ -517,35 +557,99 @@ impl SkillMesh {
         endpoint: &str,
         request: &JsonRpcRequest,
     ) -> Result<JsonRpcResponse, MeshError> {
-        let mut req = self.client.post(endpoint).json(request);
+        let auth_header = self.resolve_auth_header(skill_name, endpoint).await?;
+        proxy::post_json_rpc(&self.client, endpoint, skill_name, auth_header, request).await
+    }
 
-        // Attach Bearer when the mesh is configured for authenticated outbound
-        // calls. Auth failures are NOT silently swallowed — a misconfigured
-        // gcloud session should surface as a clear MeshError, not as an
-        // anonymous request that the cluster Gateway rejects with 401/403.
+    /// Resolve the outbound `Authorization` header value for a request against
+    /// `endpoint`. Returns `None` when the mesh is configured anonymous AND the
+    /// endpoint is outside the Azure-auth match set. Auth failures are NOT
+    /// silently swallowed — a misconfigured gcloud session must surface as a
+    /// clear `MeshError`, not as an anonymous request the cluster Gateway
+    /// would then reject with 401/403.
+    async fn resolve_auth_header(
+        &self,
+        skill_name: &str,
+        endpoint: &str,
+    ) -> Result<Option<String>, MeshError> {
         if let Some(token) = self
             .authenticator
             .bearer_token()
             .await
             .map_err(|e| MeshError::Auth(skill_name.to_string(), e))?
         {
-            req = req.bearer_auth(token);
-        } else if self.azure.should_authenticate(endpoint) {
+            return Ok(Some(format!("Bearer {token}")));
+        }
+        if self.azure.should_authenticate(endpoint) {
             let header = self
                 .azure
                 .authorization_header()
                 .await
                 .map_err(|e| MeshError::AzureAuth(azure_auth_message(e)))?;
-            req = req.header("Authorization", header);
+            return Ok(Some(header));
+        }
+        Ok(None)
+    }
+
+    /// Open an SSE stream against a streaming-capable skill's `tools/call`
+    /// endpoint. Only skills with `streaming: true` in the manifest accept
+    /// this path — calling it on a single-shot skill surfaces
+    /// `MeshError::StreamingNotEnabled` so the caller can fall back to
+    /// `call_tool` rather than receive an opaque protocol error from the
+    /// upstream HTTP server.
+    ///
+    /// The returned [`SseStream`] yields each decoded SSE event in order
+    /// (notifications first, a final response last) and exposes `cancel()` so
+    /// the IDE's `$/cancelRequest` can close the upstream connection without
+    /// waiting for the skill to finish on its own.
+    pub async fn open_streaming_call(
+        &self,
+        namespaced_name: &str,
+        arguments: Value,
+    ) -> Result<SseStream, MeshError> {
+        let (skill_name, tool_name) = parse_namespaced_tool(namespaced_name)?;
+        let snapshot = self.snapshot.load_full();
+        let skill_entry = resolve_skill_entry_in(&snapshot, &skill_name)?;
+        if !skill_entry.streaming {
+            return Err(MeshError::StreamingNotEnabled(skill_name));
         }
 
-        req.send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| MeshError::Http(skill_name.to_string(), e))?
-            .json()
-            .await
-            .map_err(|e| MeshError::Http(skill_name.to_string(), e))
+        let request = JsonRpcRequest {
+            jsonrpc: crate::mcp_types::JSONRPC_VERSION.to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": tool_name,
+                "arguments": arguments
+            })),
+        };
+
+        let auth_header = self
+            .resolve_auth_header(&skill_name, &skill_entry.endpoint)
+            .await?;
+        proxy::open_streaming_call(
+            &self.client,
+            &skill_entry.endpoint,
+            &skill_name,
+            auth_header,
+            &request,
+        )
+        .await
+    }
+
+    /// Indicates whether the skill behind `namespaced_name` is declared
+    /// streaming in the active snapshot. The stdio dispatcher reads this to
+    /// decide between `call_tool` and `open_streaming_call`; returns `false`
+    /// when the skill is unknown so the caller falls through to its usual
+    /// not-found path.
+    pub fn is_skill_streaming(&self, namespaced_name: &str) -> bool {
+        let Ok((skill_name, _)) = parse_namespaced_tool(namespaced_name) else {
+            return false;
+        };
+        let snapshot = self.snapshot.load_full();
+        resolve_skill_entry_in(&snapshot, &skill_name)
+            .map(|entry| entry.streaming)
+            .unwrap_or(false)
     }
 }
 
@@ -584,9 +688,12 @@ pub fn namespaced_tool(skill: &str, tool: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::mcp_types::{JsonRpcResponse, ToolsListResult};
+    use crate::proxy::StreamEvent;
+    use crate::test_helpers::{fake_executable, test_env};
     use axum::{response::IntoResponse, routing::post, Json, Router};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1106,16 +1213,7 @@ skills:
     }
 
     fn fake_podman(script: &str, tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "oxidized-mcp-router-podman-{tag}-{}",
-            uuid_simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("fake-podman");
-        std::fs::write(&path, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        fake_executable::write(script, tag)
     }
 
     /// Fake podman that returns success for `image exists` and emits a
@@ -1150,6 +1248,7 @@ esac
     /// One HTTP failure also bumps the breaker counter to 1.
     #[tokio::test]
     async fn http_failure_falls_back_to_podman_when_image_present() {
+        let _guard = test_env::lock();
         let (endpoint, _http_count, _handle) = mock_always_failing_with_counter().await;
         let podman_counter = std::env::temp_dir().join(format!("podman-count-{}", uuid_simple()));
         let podman_bin = fake_podman_always_works(&podman_counter);
@@ -1196,6 +1295,7 @@ skills:
     /// and not just inferred.
     #[tokio::test]
     async fn circuit_opens_after_threshold_and_skips_http() {
+        let _guard = test_env::lock();
         let (endpoint, http_count, _handle) = mock_always_failing_with_counter().await;
         let podman_counter = std::env::temp_dir().join(format!("podman-count-{}", uuid_simple()));
         let podman_bin = fake_podman_always_works(&podman_counter);
@@ -1249,6 +1349,7 @@ skills:
     /// so a recovered endpoint goes back to the HTTP path on the next call.
     #[tokio::test]
     async fn breaker_resets_on_healthy_refresh() {
+        let _guard = test_env::lock();
         let (endpoint, down, _handle) = mock_toggleable_skill_server().await;
         let podman_counter = std::env::temp_dir().join(format!("podman-count-{}", uuid_simple()));
         let podman_bin = fake_podman_always_works(&podman_counter);
@@ -1341,28 +1442,299 @@ skills:
 
         let mesh = SkillMesh::new(RegistrySource::File(path));
         mesh.refresh().await.unwrap();
-
-        // After initial refresh, server must have been called exactly once
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        // list_tools_cached when cache is fresh should NOT request the server again
         let tools = mesh.list_tools_cached().await;
         assert_eq!(tools.len(), 1);
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "fresh cache must not re-probe skills"
+        );
 
-        // Manually expire the cache snapshot
         let old_snapshot = mesh.snapshot.load();
         let expired_snapshot = MeshSnapshot {
             manifest: old_snapshot.manifest.clone(),
             aggregated_tools: old_snapshot.aggregated_tools.clone(),
             health: old_snapshot.health.clone(),
-            timestamp: Some(std::time::Instant::now() - std::time::Duration::from_secs(61)),
+            refreshed_at: Some(Instant::now() - Duration::from_secs(TOOLS_LIST_CACHE_TTL_SECS + 1)),
         };
         mesh.snapshot.store(Arc::new(expired_snapshot));
 
-        // Now calling list_tools_cached should trigger a refresh and call the server again
         let tools2 = mesh.list_tools_cached().await;
         assert_eq!(tools2.len(), 1);
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "expired cache must trigger a refresh"
+        );
+    }
+
+    // ---- SSE streaming tools/call (issue #24) ----
+
+    /// Mock skill server that handles `tools/list` synchronously and answers
+    /// `tools/call` with an SSE stream. The body the caller passes in becomes
+    /// the upstream behavior: a vec of `SseFrame`s emitted in order, with an
+    /// optional cancel-aware "tail" that keeps emitting until the upstream
+    /// connection drops. This lets one helper drive both the happy-path
+    /// streaming test and the cancellation test.
+    enum SseFrame {
+        Notification(Value),
+        Final(Value),
+    }
+
+    async fn mock_streaming_skill_server(
+        events: Vec<SseFrame>,
+        tail_after_events: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::response::sse::{Event, Sse};
+        use axum::response::IntoResponse;
+        use std::convert::Infallible;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let events = Arc::new(events);
+        let app = Router::new().route(
+            "/mcp",
+            post(move |Json(req): Json<JsonRpcRequest>| {
+                let events = events.clone();
+                async move {
+                    match req.method.as_str() {
+                        "tools/list" => Json(JsonRpcResponse::ok(
+                            req.id,
+                            serde_json::to_value(ToolsListResult {
+                                tools: vec![ToolDescriptor {
+                                    name: "long".to_string(),
+                                    description: "Long-running streaming tool".to_string(),
+                                    input_schema: json!({}),
+                                }],
+                            })
+                            .unwrap(),
+                        ))
+                        .into_response(),
+                        "tools/call" => {
+                            let (tx, rx) =
+                                tokio::sync::mpsc::channel::<Result<Event, Infallible>>(8);
+                            let events_clone = events.clone();
+                            tokio::spawn(async move {
+                                for frame in events_clone.iter() {
+                                    let payload = match frame {
+                                        SseFrame::Notification(v) | SseFrame::Final(v) => v,
+                                    };
+                                    if tx
+                                        .send(Ok(Event::default().data(payload.to_string())))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                }
+                                if tail_after_events {
+                                    // Keep emitting heartbeats until the
+                                    // receiver (= upstream connection) is
+                                    // dropped. Used to exercise the
+                                    // cancellation path: the test cancels
+                                    // mid-stream, which closes the connection
+                                    // and makes `tx.send` fail.
+                                    let mut i = 0u64;
+                                    loop {
+                                        let payload = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "notifications/progress",
+                                            "params": { "tick": i }
+                                        });
+                                        if tx
+                                            .send(Ok(Event::default().data(payload.to_string())))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                        i += 1;
+                                        tokio::time::sleep(std::time::Duration::from_millis(25))
+                                            .await;
+                                    }
+                                }
+                            });
+                            Sse::new(ReceiverStream::new(rx)).into_response()
+                        }
+                        _ => Json(JsonRpcResponse::err(req.id, -32601, "unknown method"))
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/mcp"), handle)
+    }
+
+    /// Issue #24 AC #5: a mock SSE skill server emits N data events + a
+    /// final event; the proxy delivers N notifications + 1 response. Three
+    /// notifications followed by a final result are sufficient to prove the
+    /// ordering and the response-id rewrite below.
+    #[tokio::test]
+    async fn streaming_tool_call_emits_n_notifications_then_final() {
+        let notifs = (1..=3)
+            .map(|step| {
+                SseFrame::Notification(json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": { "step": step }
+                }))
+            })
+            .collect::<Vec<_>>();
+        let mut events = notifs;
+        events.push(SseFrame::Final(json!({
+            "jsonrpc": "2.0",
+            "id": 999,
+            "result": { "content": [{ "type": "text", "text": "done" }] }
+        })));
+
+        let (endpoint, _handle) = mock_streaming_skill_server(events, false).await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: long
+    description: Streaming skill
+    endpoint: {endpoint}
+    streaming: true
+"#
+        );
+        let path = write_registry(&yaml, "sse-happy");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+        // The skill discovered as streaming-capable.
+        assert!(mesh.is_skill_streaming("long::long"));
+
+        let mut stream = mesh
+            .open_streaming_call("long::long", json!({}))
+            .await
+            .expect("streaming call should open against a streaming skill");
+
+        let mut notification_count = 0usize;
+        let mut saw_final = false;
+        while let Some(event) = stream.recv().await {
+            match event.expect("no error events expected") {
+                StreamEvent::Notification(notif) => {
+                    assert!(notif.id.is_none(), "notifications must not carry an id");
+                    assert_eq!(notif.method, "notifications/progress");
+                    notification_count += 1;
+                }
+                StreamEvent::Final(resp) => {
+                    assert!(resp.result.is_some());
+                    // The skill emitted id=999; the proxy passes that through
+                    // here — stdio is what rewrites it to the IDE's id, and
+                    // we cover that contract in the integration test above.
+                    assert_eq!(resp.id, Some(json!(999)));
+                    saw_final = true;
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            notification_count, 3,
+            "must see exactly the three notifications emitted by the mock"
+        );
+        assert!(saw_final, "must reach the Final event");
+    }
+
+    /// Issue #24 AC #1: calling `open_streaming_call` on a skill that does NOT
+    /// declare `streaming: true` surfaces a typed error instead of opening
+    /// the stream — callers can fall back to `call_tool` on that signal.
+    #[tokio::test]
+    async fn open_streaming_call_errors_when_skill_not_streaming() {
+        let (endpoint, _handle) = mock_skill_server().await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: regular
+    description: Non-streaming skill
+    endpoint: {endpoint}
+"#
+        );
+        let path = write_registry(&yaml, "sse-not-enabled");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+        assert!(!mesh.is_skill_streaming("regular::echo"));
+
+        let err = mesh
+            .open_streaming_call("regular::echo", json!({}))
+            .await
+            .expect_err("non-streaming skill must reject open_streaming_call");
+        match err {
+            MeshError::StreamingNotEnabled(name) => assert_eq!(name, "regular"),
+            other => panic!("expected StreamingNotEnabled, got {other:?}"),
+        }
+    }
+
+    /// Issue #24 AC #4: cancelling an in-flight stream closes the upstream
+    /// connection and `recv()` returns `None` promptly. We assert the
+    /// receiver closes within a generous timeout — the cancellation path is
+    /// supposed to make this immediate, not "eventually after the next
+    /// heartbeat in 30s".
+    #[tokio::test]
+    async fn cancel_closes_stream_promptly() {
+        // No "final" frame — the mock will spin notifications until the
+        // upstream connection drops. Cancellation must make that happen.
+        let (endpoint, _handle) = mock_streaming_skill_server(Vec::new(), true).await;
+        let yaml = format!(
+            r#"
+version: 1
+environment: test
+skills:
+  - name: forever
+    description: Never finishes
+    endpoint: {endpoint}
+    streaming: true
+"#
+        );
+        let path = write_registry(&yaml, "sse-cancel");
+
+        let mesh = SkillMesh::new(RegistrySource::File(path));
+        mesh.refresh().await.unwrap();
+
+        let mut stream = mesh
+            .open_streaming_call("forever::long", json!({}))
+            .await
+            .expect("streaming call should open");
+
+        // Pull one notification to confirm the stream is live, then cancel.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv())
+            .await
+            .expect("must observe a heartbeat notification within 2s")
+            .expect("channel must yield");
+        assert!(matches!(first, Ok(StreamEvent::Notification(_))));
+
+        stream.cancel();
+
+        // After cancel, the channel must close (recv → None) within a
+        // generous bound so a sleeping pump doesn't keep us stalled.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match stream.recv().await {
+                    // The pump may already have a buffered event in the
+                    // channel from before the cancel fired; drain those
+                    // and keep looking for the close signal.
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => return,
+                }
+            }
+        })
+        .await;
+        assert!(
+            next.is_ok(),
+            "stream channel must close within 2s of cancel()"
+        );
     }
 }

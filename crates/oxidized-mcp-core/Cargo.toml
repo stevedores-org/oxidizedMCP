@@ -25,3 +25,4 @@ tracing.workspace = true
 [dev-dependencies]
 axum.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-stream = "0.1"

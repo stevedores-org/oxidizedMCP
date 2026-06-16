@@ -9,17 +9,22 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "oxidized-mcp"
+name = "lornu-mcp"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 clap.workspace = true
 dirs = "6.0"
 oxidized-mcp-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = { workspace = true }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,6 +1,7 @@
 //! oxidizedMCP — Sovereign Skill Mesh proxy for agents, MCP, and skills.
 
 mod health;
+mod preset;
 mod stdio;
 
 use anyhow::{Context, Result};
@@ -39,8 +40,8 @@ macro_rules! say {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "oxidized-mcp",
-    about = "Sovereign Skill Mesh — one MCP entrypoint for all Lornu skills",
+    name = "lornu-mcp",
+    about = "Lornu MCP Preset CLI — thin stdio capability presets for clients",
     version
 )]
 struct Cli {
@@ -50,6 +51,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Serve a pre-configured capability preset
+    Serve {
+        /// Preset name (e.g. dev)
+        #[arg(long, env = "LORNU_MCP_PRESET", default_value = "dev")]
+        preset: String,
+    },
+
     /// Run the MCP stdio server (configure once in mcp.json)
     Start {
         /// Deployment environment label (staging, production, local)
@@ -112,6 +120,15 @@ async fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Serve { preset } => {
+            if preset != "dev" {
+                return Err(anyhow::anyhow!(
+                    "Unsupported preset: {preset}. Only 'dev' is supported today."
+                ));
+            }
+            info!(preset = %preset, "starting unified lornu-mcp preset stdio server");
+            preset::run_preset_server(&preset).await?;
+        }
         Commands::Start {
             env,
             registry,

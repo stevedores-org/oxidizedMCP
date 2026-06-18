@@ -1,32 +1,104 @@
 name: CI
 
+# Triggers on every PR regardless of target branch (the previous
+# `branches: [main, develop]` filter meant PRs against feature branches
+# silently skipped CI — fixed so every PR gets the gate).
 on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main, develop]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # renovate: depName=rhysd/actionlint
+  ACTIONLINT_VERSION: '1.7.12'
 
 jobs:
-  test:
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace
 
-  build:
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Match the existing ci.yml clippy invocation exactly. Adding
+      # `--workspace` would tighten coverage to the non-default member
+      # crates too — desirable, but would surface a backlog of pre-existing
+      # `await_holding_lock` lints that PR #35 is independently fixing.
+      # Tighten in a follow-up once PR #35 lands and clears that backlog.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p oxidized-mcp
+      - run: cargo test --workspace --all-features
+
+  docs:
+    name: Doc Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc (no deps, fail on broken intra-doc links)
+        # `private-intra-doc-links` is just warnings on develop today; gate
+        # on `broken-intra-doc-links` only — actual breakage, not lint-warmup.
+        env:
+          RUSTDOCFLAGS: '-D rustdoc::broken-intra-doc-links'
+        run: cargo doc --workspace --no-deps --all-features
+
+  build:
+    name: Release Build
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Build the whole workspace, not just one binary — catches cases where
+      # adding a new member crate breaks the workspace build but the previous
+      # `-p oxidized-mcp` filter hid it.
+      - run: cargo build --release --workspace
+
+  actionlint:
+    name: Lint Workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        # Install the pinned binary directly from the GitHub release tarball
+        # instead of `bash <(curl ... raw.githubusercontent.com/.../main/...)`,
+        # which was an unpinned remote-bash-exec — the script content on
+        # `main` could change without a corresponding workflow update.
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          # Unconstrained extract (matches the apko/kustomize install
+          # pattern used in lornu-ai/dockworker.ai). The single-file form
+          # `tar ... actionlint` would silently break if a future release
+          # ever nests the binary under e.g. actionlint_<ver>_linux_amd64/.
+          curl -fsSL \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C "$tmp"
+          sudo install -m 0755 "$tmp/actionlint" /usr/local/bin/actionlint
+          rm -rf "$tmp"
+          actionlint --version
+      - run: actionlint -ignore SC2086 -ignore SC1091

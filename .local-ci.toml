@@ -1,0 +1,92 @@
+# local-ci configuration for stevedores-org/oxidizedMCP
+# See: https://github.com/stevedores-org/local-ci
+#
+# Per the org standard (see CLAUDE.md / AGENTS.md across stevedores-org and
+# lornu-ai repos): every contributor and every coding agent runs `local-ci`
+# before pushing a PR. The stages here mirror what
+# `.github/workflows/ci.yml` runs in CI, so a green local-ci means a green
+# PR (modulo flakes).
+#
+# Install:  `go install github.com/stevedores-org/local-ci@latest`
+# Run all:  `local-ci`
+# One:      `local-ci clippy`   (or fmt / test / docs)
+# Fix:      `local-ci --fix`    (rustfmt + auto-fixable lints)
+
+[project]
+name = "oxidizedMCP"
+type = "rust"
+
+[cache]
+skip_dirs = [
+  ".git",
+  "target",
+  ".local-ci-cache",
+  "node_modules",
+]
+include_patterns = ["*.rs", "*.toml", "*.yml", "*.yaml", "*.md"]
+
+# ── Rust workspace ───────────────────────────────────────────────────────────
+
+[stages.fmt]
+command = ["cargo", "fmt", "--all", "--", "--check"]
+fix_command = ["cargo", "fmt", "--all"]
+description = "Rust formatting"
+timeout = 120
+enabled = true
+watch = ["**/*.rs", "rustfmt.toml"]
+
+[stages.clippy]
+# Matches `.github/workflows/ci.yml`. Add `--workspace` here when the
+# backlog of `await_holding_lock` lints in oxidized-mcp-core is cleared.
+command = [
+  "cargo",
+  "clippy",
+  "--all-targets",
+  "--all-features",
+  "--",
+  "-D",
+  "warnings",
+]
+description = "Clippy (default members) with warnings-as-errors"
+timeout = 600
+enabled = true
+watch = ["**/*.rs", "**/Cargo.toml", "Cargo.lock"]
+
+[stages.test]
+command = ["cargo", "test", "--workspace", "--all-features"]
+description = "Workspace tests"
+timeout = 1200
+enabled = true
+watch = ["**/*.rs"]
+
+[stages.docs]
+# local-ci's StageConfig has no `env` field (verified against
+# stevedores-org/local-ci config.go), so a top-level `env = { ... }` is
+# silently dropped. Set RUSTDOCFLAGS via `sh -c` so the strict
+# broken-intra-doc-links lint actually gates the local stage (matches what
+# `.github/workflows/ci.yml` runs in CI).
+command = [
+  "sh",
+  "-c",
+  "RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links' cargo doc --workspace --no-deps --all-features",
+]
+description = "Doc build (fails on broken intra-doc links)"
+timeout = 600
+enabled = true
+watch = ["**/*.rs"]
+
+# ── Workflows ────────────────────────────────────────────────────────────────
+
+[stages.actionlint]
+command = ["actionlint", "-ignore", "SC2086", "-ignore", "SC1091"]
+description = "GitHub Actions workflow lint"
+timeout = 60
+enabled = true
+watch = [".github/workflows/*.yml"]
+
+[dependencies]
+required = ["cargo"]
+optional = ["actionlint"]
+
+[workspace]
+exclude = ["target", ".local-ci-cache", "node_modules"]

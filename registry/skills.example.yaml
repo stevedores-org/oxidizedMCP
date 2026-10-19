@@ -27,3 +27,31 @@ skills:
   #   description: Lornu GKE fleet agent skill for fleet membership, Gateway API, workload identity, and cluster attach workflows
   #   endpoint: http://127.0.0.1:8080/mcp
   #   enabled: true
+
+  # Gap & OrbStack Cloud (OSC) skills (`stevedores-org/orb-stack-cloud` + `lornu-ai/gap`).
+  # Full fragments live in `stevedores-org/orb-stack-cloud` under:
+  #   - `blueprint/gap/mcp/oxidized-skill.example.yaml`
+  #   - `blueprint/webmcp-chromeos/mcp/oxidized-skill.example.yaml`
+  #   - `docs/OSC-MCP-SKILLS.md`
+  #
+  # - name: gap
+  #   description: Gap org MCP server on Cloudflare Workers behind Cloudflare Access (LOR-578)
+  #   endpoint: https://gap.airesearches.app/mcp
+  #   enabled: true
+  #
+  # - name: orbstack
+  #   description: OrbStack / kubectl helpers for OSC Gap overlays (read + allowlisted mac-a apply)
+  #   endpoint: http://127.0.0.1:9320/mcp
+  #   enabled: true
+  #   # image: ghcr.io/stevedores-org/osc-skill-orbstack:latest
+  #
+  # - name: tailscale
+  #   description: Tailnet status, Serve status, ACL lint; no secret exfil
+  #   endpoint: http://127.0.0.1:9321/mcp
+  #   enabled: true
+  #   # image: ghcr.io/stevedores-org/osc-skill-tailscale:latest
+  #
+  # - name: chrome-devtools
+  #   description: Chrome DevTools for Agents (CDP via chrome-devtools-mcp) for Gap web / WebMCP QA
+  #   endpoint: http://127.0.0.1:9310/mcp
+  #   enabled: true
